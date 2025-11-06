@@ -1,0 +1,58 @@
+QWEN_VL_PROMPT = """You are an expert video analyst and annotation specialist. Your task is to generate a detailed, time-ordered description of the video.
+
+Your primary goal is to precisely capture the camera movement and the resulting changes in content as the scene unfolds. My ultimate aim is to use these captions to train a view-controlled video generation model.
+
+Strict Instructions:
+1.  Describe Chronologically: Describe the events and changes sequentially, from the beginning of the video to the end.
+2.  Specify Camera Movement: You MUST use precise verbs to describe the camera's motion, such as:
+    * `The camera pans left...`
+    * `The camera pans right...`
+    * `The camera tilts up...`
+    * `The camera tilts down...`
+    * `The camera dollies in / pushes in / zooms in...`
+    * `The camera dollies out / pulls back / zooms out...`
+    * `The camera orbits (clockwise/counter-clockwise)...`
+3.  Link Content to Movement: You MUST explicitly connect the camera movement to the new or changing content. Use connecting phrases like "as the camera...", "revealing...", "which then shows...", or "bringing...into view."
+
+Absolute Prohibitions:
+* DO NOT provide a general summary of the video (e.g., "This video is about...").
+* DO NOT describe the content without mentioning the camera movement.
+* DO NOT describe the camera movement without mentioning the content.
+
+Output Format Examples (Follow Strictly):
+
+* Example 1 (Pan): "The video begins with the camera panning slowly to the right, starting from a tree, which gradually reveals a person sitting on a bench."
+* Example 2 (Dolly/Zoom): "The camera starts to push in, focusing on a vase on the table. As the camera moves closer, the intricate patterns on the vase become clearly visible."
+* Example 3 (Tilt): "The shot starts at the subject's feet, and the camera steadily tilts up, moving past their body and finally resting on their facial expression."
+* Example 4 (Orbit): "The camera begins to orbit clockwise around a statue, starting from the front and progressively showing its side and back details."
+
+---
+Task Start:
+Now, analyze the provided video and generate a detailed, time-ordered, "camera-aware" caption, strictly following the instructions and examples provided.
+"""
+
+#!/bin/bash
+
+# 定义一个“停止文件”的路径
+STOP_FILE="/home/your_user/stop_gpu_0" # 确保路径正确
+
+# 只有当“停止文件”不存在时，才执行循环
+while [[ ! -f "$STOP_FILE" ]]; do
+    echo "[$(date)] 启动 GPU 0 占用程序..."
+    python occupy_single_gpu.py 0
+
+    # 如果在 python 运行时，停止文件被创建了，就退出
+    if [[ -f "$STOP_FILE" ]]; then
+        echo "[$(date)] 检测到停止文件，退出循环。"
+        break
+    fi
+
+    echo "[$(date)] 进程已退出(可能崩溃)。5秒后重启..."
+    sleep 5
+done
+
+# 脚本停止后，自动删除这个停止文件，方便下次启动
+rm -f "$STOP_FILE"
+echo "[$(date)] 守护程序已停止。"
+
+nohup ./run_occupier_0.sh > occupy_0_wrapper.log 2>&1 &
