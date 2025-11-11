@@ -1,58 +1,609 @@
-QWEN_VL_PROMPT = """You are an expert video analyst and annotation specialist. Your task is to generate a detailed, time-ordered description of the video.
+python examples/wan2.1/predict_i2v_multicase.py --json_path /mnt/data/ssd/user_workspace/duanke/VideoX-Fun/7direction_multicase_1024/i2v-bench-info_zoomout.json --save_path samples/wan-videos-i2v/test_1024_10k_16batch__3_step_lora_test/1021model_zoomout_1 --lora_weight 1.0
 
-Your primary goal is to precisely capture the camera movement and the resulting changes in content as the scene unfolds. My ultimate aim is to use these captions to train a view-controlled video generation model.
+import json
+import os
+import sys
+import numpy as np
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from omegaconf import OmegaConf
+# os.environ["CUDA_VISIBLE_DEVICES"] = '7'
+from PIL import Image, ImageOps
+from transformers import AutoTokenizer
+import tempfile
 
-Strict Instructions:
-1.  Describe Chronologically: Describe the events and changes sequentially, from the beginning of the video to the end.
-2.  Specify Camera Movement: You MUST use precise verbs to describe the camera's motion, such as:
-    * `The camera pans left...`
-    * `The camera pans right...`
-    * `The camera tilts up...`
-    * `The camera tilts down...`
-    * `The camera dollies in / pushes in / zooms in...`
-    * `The camera dollies out / pulls back / zooms out...`
-    * `The camera orbits (clockwise/counter-clockwise)...`
-3.  Link Content to Movement: You MUST explicitly connect the camera movement to the new or changing content. Use connecting phrases like "as the camera...", "revealing...", "which then shows...", or "bringing...into view."
+current_file_path = os.path.abspath(__file__)
+project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dirname(current_file_path)), os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))]
+for project_root in project_roots:
+    sys.path.insert(0, project_root) if project_root not in sys.path else None
 
-Absolute Prohibitions:
-* DO NOT provide a general summary of the video (e.g., "This video is about...").
-* DO NOT describe the content without mentioning the camera movement.
-* DO NOT describe the camera movement without mentioning the content.
+from videox_fun.dist import set_multi_gpus_devices, shard_model
+from videox_fun.models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
+                              WanT5EncoderModel, WanTransformer3DModel)
+from videox_fun.models.cache_utils import get_teacache_coefficients
+from videox_fun.pipeline import WanI2VPipeline
+from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, replace_parameters_by_name,
+                                              convert_weight_dtype_wrapper)
+from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
+from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
+                                   save_videos_grid)
+from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+import argparse
 
-Output Format Examples (Follow Strictly):
+import time
 
-* Example 1 (Pan): "The video begins with the camera panning slowly to the right, starting from a tree, which gradually reveals a person sitting on a bench."
-* Example 2 (Dolly/Zoom): "The camera starts to push in, focusing on a vase on the table. As the camera moves closer, the intricate patterns on the vase become clearly visible."
-* Example 3 (Tilt): "The shot starts at the subject's feet, and the camera steadily tilts up, moving past their body and finally resting on their facial expression."
-* Example 4 (Orbit): "The camera begins to orbit clockwise around a statue, starting from the front and progressively showing its side and back details."
+def parse_args():
+    parser = argparse.ArgumentParser(description="Video generation configuration")
 
----
-Task Start:
-Now, analyze the provided video and generate a detailed, time-ordered, "camera-aware" caption, strictly following the instructions and examples provided.
-"""
+    parser.add_argument("--json_path", type=str, 
+                       default="inference_cases.json",
+                       help="Path to JSON file containing inference cases")
+    
+    parser.add_argument(
+        "--gpu", 
+        type=str, 
+        default="1",  # 默认使用GPU 0
+        help="指定要使用的GPU ID。例如: '0', '0,1', '2,3'"
+    )
+    
+    parser.add_argument("--seed", type=int, default=43,
+                       help="Random seed for reproducibility")
+    
+    parser.add_argument("--save_path", type=str, default="samples/image_tests_black_new_720p_pose2",
+                       help="Path to save generated outputs")
+    
+    parser.add_argument("--not_use_lora", action="store_true")
+    
+    parser.add_argument("--sample_size", default="[720, 1280]")
 
-#!/bin/bash
+    parser.add_argument("--lora_weight", type=float, default=1.0)
 
-# 定义一个“停止文件”的路径
-STOP_FILE="/home/your_user/stop_gpu_0" # 确保路径正确
+    parser.add_argument("--different_lora", type=bool, default=False)
 
-# 只有当“停止文件”不存在时，才执行循环
-while [[ ! -f "$STOP_FILE" ]]; do
-    echo "[$(date)] 启动 GPU 0 占用程序..."
-    python occupy_single_gpu.py 0
+    return parser.parse_args()
 
-    # 如果在 python 运行时，停止文件被创建了，就退出
-    if [[ -f "$STOP_FILE" ]]; then
-        echo "[$(date)] 检测到停止文件，退出循环。"
-        break
-    fi
+def load_inference_cases(json_path):
+    with open(json_path, 'r') as f:
+        cases = json.load(f)
+    return cases
 
-    echo "[$(date)] 进程已退出(可能崩溃)。5秒后重启..."
-    sleep 5
-done
+def initialize_pipeline(args):
+    negative_prompt = "bright colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still picture, cluttered background, three legs, many people in the background, walking backwards"
+    guidance_scale = 0.0
+    num_inference_steps = 4
+    lora_weight = args.lora_weight
 
-# 脚本停止后，自动删除这个停止文件，方便下次启动
-rm -f "$STOP_FILE"
-echo "[$(date)] 守护程序已停止。"
+    GPU_memory_mode     = "model_cpu_offload"
+    ulysses_degree      = 1
+    ring_degree         = 1
+    fsdp_dit            = False
+    fsdp_text_encoder   = True
+    compile_dit         = False
+    enable_teacache     = False
+    teacache_threshold  = 0.10
+    num_skip_start_steps = 5
+    teacache_offload    = False
+    cfg_skip_ratio      = 0
+    enable_riflex       = False
+    riflex_k            = 6
+    config_path         = "config/wan2.1/wan_civitai.yaml"
+    model_name          = "/mnt/data/ssd/user_data/qiaoyu/LTV/Wan2.1-I2V-14B-480P-4steps/"
+    sampler_name        = "Flow_Unipc"
+    shift               = 5.0 
+    transformer_path    = None
+    vae_path            = None
+    sample_size         = [int(x) for x in args.sample_size.strip("[]").split(",")]
+    video_length        = 81
+    fps                 = 16
+    weight_dtype        = torch.bfloat16
 
-nohup ./run_occupier_0.sh > occupy_0_wrapper.log 2>&1 &
+    device = set_multi_gpus_devices(ulysses_degree, ring_degree)
+    config = OmegaConf.load(config_path)
+
+    # Initialize models
+    transformer = WanTransformer3DModel.from_pretrained(
+        os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
+        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    )
+
+    if transformer_path is not None:
+        print(f"From checkpoint: {transformer_path}")
+        if transformer_path.endswith("safetensors"):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(transformer_path)
+        else:
+            state_dict = torch.load(transformer_path, map_location="cpu")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+        m, u = transformer.load_state_dict(state_dict, strict=False)
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+
+    vae = AutoencoderKLWan.from_pretrained(
+        os.path.join(model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
+        additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
+    ).to(weight_dtype)
+
+    if vae_path is not None:
+        print(f"From checkpoint: {vae_path}")
+        if vae_path.endswith("safetensors"):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(vae_path)
+        else:
+            state_dict = torch.load(vae_path, map_location="cpu")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+        m, u = vae.load_state_dict(state_dict, strict=False)
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(model_name, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
+    )
+
+    text_encoder = WanT5EncoderModel.from_pretrained(
+        os.path.join(model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
+        additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    )
+    text_encoder = text_encoder.eval()
+
+    clip_image_encoder = CLIPModel.from_pretrained(
+        os.path.join(model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    ).to(weight_dtype)
+    clip_image_encoder = clip_image_encoder.eval()
+
+    Choosen_Scheduler = {
+        "Flow": FlowMatchEulerDiscreteScheduler,
+        "Flow_Unipc": FlowUniPCMultistepScheduler,
+        "Flow_DPM++": FlowDPMSolverMultistepScheduler,
+    }[sampler_name]
+    
+    if sampler_name == "Flow_Unipc" or sampler_name == "Flow_DPM++":
+        config['scheduler_kwargs']['shift'] = 1
+    scheduler = Choosen_Scheduler(
+        **filter_kwargs(Choosen_Scheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+    )
+
+    pipeline = WanI2VPipeline(
+        transformer=transformer,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scheduler=scheduler,
+        clip_image_encoder=clip_image_encoder
+    )
+    
+    if ulysses_degree > 1 or ring_degree > 1:
+        from functools import partial
+        transformer.enable_multi_gpus_inference()
+        if fsdp_dit:
+            shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+            pipeline.transformer = shard_fn(pipeline.transformer)
+            print("Add FSDP DIT")
+        if fsdp_text_encoder:
+            shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+            pipeline.text_encoder = shard_fn(pipeline.text_encoder)
+            print("Add FSDP TEXT ENCODER")
+
+    if compile_dit:
+        for i in range(len(pipeline.transformer.blocks)):
+            pipeline.transformer.blocks[i] = torch.compile(pipeline.transformer.blocks[i])
+        print("Add Compile")
+
+    if GPU_memory_mode == "sequential_cpu_offload":
+        replace_parameters_by_name(transformer, ["modulation",], device=device)
+        transformer.freqs = transformer.freqs.to(device=device)
+        pipeline.enable_sequential_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_cpu_offload_and_qfloat8":
+        convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+        convert_weight_dtype_wrapper(transformer, weight_dtype)
+        pipeline.enable_model_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_cpu_offload":
+        pipeline.enable_model_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_full_load_and_qfloat8":
+        convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+        convert_weight_dtype_wrapper(transformer, weight_dtype)
+        pipeline.to(device=device)
+    else:
+        pipeline.to(device=device)
+
+    coefficients = get_teacache_coefficients(model_name) if enable_teacache else None
+    if coefficients is not None:
+        print(f"Enable TeaCache with threshold {teacache_threshold} and skip the first {num_skip_start_steps} steps.")
+        pipeline.transformer.enable_teacache(
+            coefficients, num_inference_steps, teacache_threshold, num_skip_start_steps=num_skip_start_steps, offload=teacache_offload
+        )
+
+    if cfg_skip_ratio is not None:
+        print(f"Enable cfg_skip_ratio {cfg_skip_ratio}.")
+        pipeline.transformer.enable_cfg_skip(cfg_skip_ratio, num_inference_steps)
+
+    return pipeline, device, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight
+
+# def process_case(pipeline, device, case, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight, save_path, seed, not_use_lora, different_lora):
+#     generator = torch.Generator(device=device).manual_seed(seed)
+    
+#     if different_lora:
+#         # Merge LoRA if specified
+#         if case.get('lora_path') and not not_use_lora:
+#             pipeline = merge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+        
+#         with torch.no_grad():
+#             latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+#             input_video, input_video_mask, clip_image = get_image_to_video_latent(
+#                 case['start_image'], None, video_length=video_length, sample_size=sample_size
+#             )
+
+#             sample = pipeline(
+#                 case['prompt'], 
+#                 num_frames=video_length,
+#                 negative_prompt=negative_prompt,
+#                 height=sample_size[0],
+#                 width=sample_size[1],
+#                 generator=generator,
+#                 guidance_scale=guidance_scale,
+#                 num_inference_steps=num_inference_steps,
+#                 video=input_video,
+#                 mask_video=input_video_mask,
+#                 clip_image=clip_image,
+#                 shift=shift,
+                
+#             ).videos
+        
+#         # Unmerge LoRA if it was merged
+#         if case.get('lora_path'):
+#             pipeline = unmerge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+
+#     else:
+#         with torch.no_grad():
+#             latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+#             input_video, input_video_mask, clip_image = get_image_to_video_latent(
+#                 case['start_image'], None, video_length=video_length, sample_size=sample_size
+#             )
+
+#             sample = pipeline(
+#                 case['prompt'], 
+#                 num_frames=video_length,
+#                 negative_prompt=negative_prompt,
+#                 height=sample_size[0],
+#                 width=sample_size[1],
+#                 generator=generator,
+#                 guidance_scale=guidance_scale,
+#                 num_inference_steps=num_inference_steps,
+#                 video=input_video,
+#                 mask_video=input_video_mask,
+#                 clip_image=clip_image,
+#                 shift=shift,
+#             ).videos
+    
+#     return sample
+
+def process_case(pipeline, device, case, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight, save_path, seed, not_use_lora, different_lora):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    
+    # [新增] 准备一个变量来存储我们将要使用的最终图像路径
+    input_image_path_to_use = None
+    
+    # --- [关键修改: 图像预处理 + 保存到临时文件] ---
+    try:
+        # 1. 确定目标尺寸
+        target_height = sample_size[0]
+        target_width = sample_size[1]
+        target_size_pil = (target_width, target_height) 
+
+        # 2. 加载原始图像
+        with Image.open(case['start_image']) as image:
+            image = image.convert('RGB')
+            
+            # 3. 创建副本并等比缩放
+            img_copy = image.copy()
+            img_copy.thumbnail(target_size_pil, Image.Resampling.LANCZOS)
+            
+            # 4. 创建黑色背景
+            background = Image.new('RGB', target_size_pil, (0, 0, 0))
+            
+            # 5. 计算居中位置
+            paste_x = (target_width - img_copy.width) // 2
+            paste_y = (target_height - img_copy.height) // 2
+            
+            # 6. 粘贴
+            background.paste(img_copy, (paste_x, paste_y))
+            
+            # 7. [新] 将这个带黑边的图像保存到临时文件
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_f:
+                background.save(temp_f.name)
+                # 8. [新] 我们将使用这个临时文件的 *路径*
+                input_image_path_to_use = temp_f.name
+
+    except Exception as e:
+        print(f"警告: 图像预处理失败 {case['start_image']}。错误: {e}")
+        print("将尝试直接使用原始图像路径，这可能导致拉伸。")
+        # 回退：直接使用原始路径
+        input_image_path_to_use = case['start_image']
+    # --- [修改结束] ---
+
+    
+    # 我们将把推理和文件清理放入 try...finally 结构
+    # 以确保无论推理是否成功，临时文件都会被删除
+    try:
+        if different_lora:
+            # Merge LoRA
+            if case.get('lora_path') and not not_use_lora:
+                pipeline = merge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+            
+            with torch.no_grad():
+                latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+                # [修改] 使用 'input_image_path_to_use' (这是一个字符串路径)
+                input_video, input_video_mask, clip_image = get_image_to_video_latent(
+                    input_image_path_to_use, None, video_length=video_length, 
+                    sample_size=sample_size
+                )
+
+                sample = pipeline(
+                    case['prompt'], 
+                    num_frames=video_length,
+                    negative_prompt=negative_prompt,
+                    height=sample_size[0],
+                    width=sample_size[1],
+                    generator=generator,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    video=input_video,
+                    mask_video=input_video_mask,
+                    clip_image=clip_image,
+                    shift=shift,
+                ).videos
+            
+            # Unmerge LoRA
+            if case.get('lora_path'):
+                pipeline = unmerge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+
+        else:
+            with torch.no_grad():
+                latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+                # [修改] (同样) 使用 'input_image_path_to_use' (字符串路径)
+                input_video, input_video_mask, clip_image = get_image_to_video_latent(
+                    input_image_path_to_use, None, video_length=video_length, 
+                    sample_size=sample_size
+                )
+
+                sample = pipeline(
+                    case['prompt'], 
+                    num_frames=video_length,
+                    negative_prompt=negative_prompt,
+                    height=sample_size[0],
+                    width=sample_size[1],
+                    generator=generator,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    video=input_video,
+                    mask_video=input_video_mask,
+                    clip_image=clip_image,
+                    shift=shift,
+                ).videos
+        
+        return sample
+
+    finally:
+        # [新] 清理临时文件
+        # 确保我们创建了临时文件(input_image_path_to_use 不是 None)
+        # 并且它不是原始的图像文件(以防预处理失败时回退)
+        if input_image_path_to_use and input_image_path_to_use != case['start_image']:
+            if os.path.exists(input_image_path_to_use):
+                os.remove(input_image_path_to_use)
+                # print(f"已删除临时文件: {input_image_path_to_use}")
+
+# def process_case(pipeline, device, case, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight, save_path, seed, not_use_lora, different_lora):
+#     generator = torch.Generator(device=device).manual_seed(seed)
+    
+#     # [新增] 准备一个变量来存储我们将要使用的最终图像路径
+#     input_image_path_to_use = None
+    
+#     # --- [关键修改: 图像预处理 (中心裁剪)] ---
+#     try:
+#         # 1. 确定目标尺寸 (H, W)
+#         target_height = sample_size[0] # 480
+#         target_width = sample_size[1]  # 832
+        
+#         # 2. PIL 操作图像时使用 (Width, Height)
+#         target_size_pil = (target_width, target_height) 
+
+#         # 3. 加载原始图像
+#         with Image.open(case['start_image']) as image:
+#             image = image.convert('RGB')
+            
+#             # 4. [新] 使用 ImageOps.fit 进行缩放和中心裁剪
+#             #    此函数会：
+#             #    a. 智能缩放图像，使其较短的边等于目标尺寸
+#             #    b. 保持宽高比
+#             #    c. 从中心裁剪掉多余的部分
+#             #    d. 最终输出一张 832x480 的图像
+#             cropped_image = ImageOps.fit(image, target_size_pil, Image.Resampling.LANCZOS)
+            
+#             # 5. [不变] 将这个处理后的图像保存到临时文件
+#             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_f:
+#                 cropped_image.save(temp_f.name)
+#                 # 6. [不变] 我们将使用这个临时文件的 *路径*
+#                 input_image_path_to_use = temp_f.name
+
+#     except Exception as e:
+#         print(f"警告: 图像预处理失败 {case['start_image']}。错误: {e}")
+#         print("将尝试直接使用原始图像路径，这可能导致拉伸。")
+#         # 回退：直接使用原始路径
+#         input_image_path_to_use = case['start_image']
+#     # --- [修改结束] ---
+
+    
+#     # 我们将把推理和文件清理放入 try...finally 结构
+#     # (这部分代码与上一版完全相同)
+#     try:
+#         if different_lora:
+#             # Merge LoRA
+#             if case.get('lora_path') and not not_use_lora:
+#                 pipeline = merge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+            
+#             with torch.no_grad():
+#                 latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+#                 # [不变] 使用 'input_image_path_to_use' (这是一个字符串路径)
+#                 input_video, input_video_mask, clip_image = get_image_to_video_latent(
+#                     input_image_path_to_use, None, video_length=video_length, 
+#                     sample_size=sample_size
+#                 )
+
+#                 sample = pipeline(
+#                     case['prompt'], 
+#                     num_frames=video_length,
+#                     negative_prompt=negative_prompt,
+#                     height=sample_size[0],
+#                     width=sample_size[1],
+#                     generator=generator,
+#                     guidance_scale=guidance_scale,
+#                     num_inference_steps=num_inference_steps,
+#                     video=input_video,
+#                     mask_video=input_video_mask,
+#                     clip_image=clip_image,
+#                     shift=shift,
+#                 ).videos
+            
+#             # Unmerge LoRA
+#             if case.get('lora_path'):
+#                 pipeline = unmerge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+
+#         else:
+#             with torch.no_grad():
+#                 latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+#                 # [不变] (同样) 使用 'input_image_path_to_use' (字符串路径)
+#                 input_video, input_video_mask, clip_image = get_image_to_video_latent(
+#                     input_image_path_to_use, None, video_length=video_length, 
+#                     sample_size=sample_size
+#                 )
+
+#                 sample = pipeline(
+#                     case['prompt'], 
+#                     num_frames=video_length,
+#                     negative_prompt=negative_prompt,
+#                     height=sample_size[0],
+#                     width=sample_size[1],
+#                     generator=generator,
+#                     guidance_scale=guidance_scale,
+#                     num_inference_steps=num_inference_steps,
+#                     video=input_video,
+#                     mask_video=input_video_mask,
+#                     clip_image=clip_image,
+#                     shift=shift,
+#                 ).videos
+        
+#         return sample
+
+#     finally:
+#         # [不变] 清理临时文件
+#         if input_image_path_to_use and input_image_path_to_use != case['start_image']:
+#             if os.path.exists(input_image_path_to_use):
+#                 os.remove(input_image_path_to_use)
+#                 # print(f"已删除临时文件: {input_image_path_to_use}")
+
+def save_results(sample, save_path, case_idx, video_length, fps):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path, exist_ok=True)
+
+    prefix = str(case_idx).zfill(4)
+    if video_length == 1:
+        video_path = os.path.join(save_path, f"{prefix}.png")
+        image = sample[0, :, 0]
+        image = image.transpose(0, 1).transpose(1, 2)
+        image = (image * 255).numpy().astype(np.uint8)
+        image = Image.fromarray(image)
+        image.save(video_path)
+    else:
+        video_path = os.path.join(save_path, f"{prefix}.mp4")
+        save_videos_grid(sample, video_path, fps=fps)
+    
+    return video_path
+
+def main():
+    args = parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    cases = load_inference_cases(args.json_path)
+    
+    # Initialize pipeline once
+    pipeline, device, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight = initialize_pipeline(args)
+
+    if not args.different_lora and not args.not_use_lora:
+        pipeline = merge_lora(pipeline, cases[0]['lora_path'], lora_weight, device=device)
+        print("info: lora merged!")
+    
+    # Process each case
+    for idx, case in enumerate(cases):
+        print(f"Processing case {idx + 1}/{len(cases)}: {case['prompt'][:50]}...")
+        
+        try:
+            t1 = time.time()
+            sample = process_case(
+                pipeline, device, case, video_length, sample_size, fps, shift, 
+                negative_prompt, guidance_scale, num_inference_steps, lora_weight, 
+                args.save_path, args.seed + idx, args.not_use_lora, args.different_lora
+            )
+            
+            output_path = save_results(sample, args.save_path, idx + 1, video_length, fps)
+            print(f"Saved output for case {idx + 1} to: {output_path}")
+            print("inference_consume",time.time()-t1)
+            
+        except Exception as e:
+            print(f"Error processing case {idx + 1}: {str(e)}")
+            continue
+
+if __name__ == "__main__":
+    main()
+
+[
+  {
+    "lora_path": "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/output_dir_14b_1021_7directions_32batchsize_8e-5lr/checkpoint-2000.safetensors",
+    "start_image": "/mnt/data/hdd/user_workspace/wangbohao/image_eval/sample_png/0.png",
+    "prompt": "CamZmO effect, A glamorous couple in vintage attire, the woman in a striking red dress and hat, the man in a sharp suit, stand intimately close in a richly decorated, dimly lit room with red damask wallpaper, as the camera slowly zooms out to reveal the full elegance of their pose and the opulent, nostalgic setting around them."
+  },
+  {
+    "lora_path": "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/output_dir_14b_1021_7directions_32batchsize_8e-5lr/checkpoint-2000.safetensors",
+    "start_image": "/mnt/data/hdd/user_workspace/wangbohao/image_eval/sample_png/1.png",
+    "prompt": "CamTilU effect, A woman with long, wavy blonde hair, dressed in a white blouse and a blue skirt, leans casually against a metal railing on a stone staircase in an urban setting. The camera gently tilts upwards, following her gaze as she looks over her shoulder, emphasizing the soft light and the architectural details of the building behind her."
+  },
+
+import os
+import json
+
+# camera_modes = ['CamPanL', 'CamPanR', 'CamStc', 'CamTilD', 'CamTilU', 'CamZmI', 'CamZmO']
+# origin_path = '/mnt/data/hdd/user_workspace/wangbohao/image_eval/caption.json'
+save_path = '/mnt/data/hdd/user_workspace/wangbohao/image_eval/combined_info.json'
+# with open(origin_path, 'r') as f:
+#     data = json.load(f)
+# new_data = {}
+# for i in range(21):
+#     image_path = f'/mnt/data/hdd/user_workspace/wangbohao/image_eval/sample_png/{i}.png'
+#     caption = data[image_path]
+#     caption = camera_modes[i%7] + ' effect, ' + caption[0]
+#     new_data[image_path] = caption
+#     with open(save_path, 'w') as f:
+#         json.dump(new_data, f, indent=2, ensure_ascii=False)
+
+with open(save_path, 'r') as f:
+    data = json.load(f)
+all_info = []
+# for _, image_path, caption in data.items():
+#     combined_info = {}
+#     combined_info['lora_path'] = "/mnt/data/hdd/user_workspace/wangbohao/VideoX-Fun-main/models/checkpoint-2000.safetensors"
+#     combined_info['start_image'] = image_path
+#     combined_info['prompt'] = caption
+#     all_info.append(combined_info)
+for one_item in data:
+    _, image_path, caption = one_item.values()
+    combined_info = {}
+    combined_info['lora_path'] = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/output_dir_14b_1021_7directions_32batchsize_8e-5lr/checkpoint-2000.safetensors"
+    combined_info['start_image'] = image_path
+    combined_info['prompt'] = caption
+    all_info.append(combined_info)
+with open('./combined_info_origin.json', 'w') as f:
+    json.dump(all_info, f, indent=2, ensure_ascii=False)
