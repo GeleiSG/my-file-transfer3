@@ -1,208 +1,64 @@
-import torch
-import decord
-import argparse
-import random
+# [最终版 - 强调运镜时主体静止]
+# 这是一个为VLM（视频语言模型）设计的"系统"或"前缀"指令（prompt）。
+# 它指示VLM为输入的视频生成一个特定格式的、用于AI训练的caption。
+VLM_CAPTION_PROMPT = """You are an expert technical video analyst and caption generator. Your sole purpose is to generate a single-line descriptive caption for a video, which will be used to train an AI model.
 
-import pandas as pd
-import numpy as np
+You **must** follow these rules exactly:
 
-from tqdm import tqdm
-from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer, AutoProcessor
+**1. The Output Format:**
+The caption **must** be a single line and follow this exact rigid format:
+`The shot {Motion Description}({Motion_Code}), {Content Description}.`
 
-from torch.utils.data import DataLoader
+**2. Motion Classification:**
+You must first identify the primary motion. You must classify this motion using **only** one of the following {Motion Description} and {Motion_Code} pairs.
 
-SYSTEM_PROMPT = "Please imagine the video, and provide a faithfully concise description of the following content:\n" \
-"1. Detailed description of this video in more than three sentences. Here are some examples of good descriptions: 1) A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about. 2) A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors.\n" \
-"2. Description of the main subject actions or status sequence. This suggests including the main subjects (person, object, animal, or none) and their attributes, their action, their position, and movements during the video frames.\n" \
-"3. Summary of the background. This should also include the objects, location, weather, and time.\n" \
-"4. Summary of the view shot, camera movement and changes in shooting angles in the sequence of video frames.\n" \
-"5. Briefly one-sentence Summary of the visual, Photographic and artistic style.\n" \
-"No need to provide summary content. Do not describe each frame individually. Do not reply with words like 'first frame'. The description should be useful for AI to re-generate the video."
+* **Static (主体运动):**
+    * `is static(Static)`
+* **Pan (左右旋转):**
+    * `pans left(Pan_Left)`
+    * `pans right(Pan_Right)`
+* **Tilt (俯仰):**
+    * `tilts up(Tilt_Up)`
+    * `tilts down(Tilt_Down)`
+* **Pedestal (上下平移):**
+    * `pedestals up(Pedestal_Up)`
+    * `pedestals down(Pedestal_Down)`
+* **Truck (左右平移):**
+    * `trucks left(Truck_Left)`
+    * `trucks right(Truck_Right)`
+* **Dolly (前后平移):**
+    * `dollies in(Translate_Z_Forward)`
+    * `pulls out(Translate_Z_Backward)`
+* **Zoom (镜头变焦):**
+    * `zooms in(Zoom_In)`
+    * `zooms out(Zoom_Out)`
+* **Dolly Zoom (希区柯克变焦):**
+    * `dolly zooms (compressing background)(Dolly_Zoom_Compress)`
+    * `dolly zooms (expanding background)(Dolly_Zoom_Expand)`
 
+**3. Stillness Constraint (CRITICAL):**
+This is the most important rule. You must distinguish between camera motion and subject motion.
+* **If the camera is moving** (any code *except* `(Static)`): The subject (person) **must** remain perfectly still. Their pose, expression, and position must be static.
+* **If the subject is moving** (e.g., waving, nodding): You **must** classify the camera motion as `is static(Static)`.
 
-class VideoTextDataset(torch.utils.data.Dataset):
-    def __init__(self, csv_path, model_path):
-        if isinstance(csv_path, pd.DataFrame):
-            self.meta = csv_path
-        else:
-            self.meta = pd.read_csv(csv_path)
-        self._path = 'path'
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.processor = AutoProcessor.from_pretrained(model_path)
+**4. Content Description:**
+The `{Content Description}` part must describe the person (subject) based on Rule 3.
+* For `(Static)`: Describe the subject's **action** (e.g., "a person waves their hand").
+* For all other motions: Describe the **static subject** being framed by the moving camera (e.g., "panning across a person's static face").
 
-        print(len(self.meta))
- 
-    def __getitem__(self, index):
-        try:
-            row = self.meta.iloc[index]
-            path = row[self._path]
-            real_index = self.meta.index[index]
-            vr = decord.VideoReader(path, ctx=decord.cpu(0), width=360, height=420)
-            start = 0
-            end = len(vr)
-            # avg_fps = vr.get_avg_fps()
-            index = self.get_index(end-start, 16, st=start)
-            frames = vr.get_batch(index).asnumpy() # n h w c
-            video_inputs = [torch.from_numpy(frames).permute(0, 3, 1, 2)]
-            conversation = {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "video",
-                                "video": row['path'],
-                                "max_pixels": 360 * 420, # 460800
-                                "fps": 2.0,
-                            },
-                            {  
-                                "type": "text",
-                                "text": SYSTEM_PROMPT
-                            },
-                        ],
-                    }
-                   
-            # 生成 user_input
-            user_input = self.processor.apply_chat_template(
-                [conversation],
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            results = dict()
-            inputs = {
-                'prompt': user_input,
-                'multi_modal_data': {'video': video_inputs}
-            }
-            results["index"] = real_index
-            results['input'] = inputs
-            return results
-        except Exception as e:
-            index = random.randint(0, len(self.meta)-1)
-            row = self.meta.iloc[index]
-            path = row[self._path]
-            real_index = self.meta.index[index]
-            vr = decord.VideoReader(path, ctx=decord.cpu(0), width=360, height=420)
-            start = 0
-            end = len(vr)
-            # avg_fps = vr.get_avg_fps()
-            index = self.get_index(end-start, 16, st=start)
-            frames = vr.get_batch(index).asnumpy() # n h w c
-            video_inputs = [torch.from_numpy(frames).permute(0, 3, 1, 2)]
-            conversation = {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "video",
-                                "video": row['path'],
-                                "max_pixels": 360 * 420, # 460800
-                                "fps": 4.0,
-                            },
-                            {  
-                                "type": "text",
-                                "text": SYSTEM_PROMPT
-                            },
-                        ],
-                    }
-                   
-            # 生成 user_input
-            user_input = self.processor.apply_chat_template(
-                [conversation],
-                tokenize=False,
-                add_generation_prompt=True
-            )
-            results = dict()
-            inputs = {
-                'prompt': user_input,
-                'multi_modal_data': {'video': video_inputs}
-            }
-            results["index"] = real_index
-            results['input'] = inputs
-            return results
+**5. Examples (In-Context Learning):**
+This is how your final output must look. Note how all motion examples describe a static person.
 
+* *(Example for Pan):* `The shot pans left(Pan_Left), moving across the person's static face.`
+* *(Example for Tilt):* `The shot tilts up(Tilt_Up), moving from the person's static shoulders to their face.`
+* *(Example for Pedestal):* `The shot pedestals down(Pedestal_Down), lowering the frame from the person's eyes to their chin, while they remain still.`
+* *(Example for Dolly):* `The shot dollies in(Translate_Z_Forward), moving slowly closer to the person's static face.`
+* *(Example for Dolly Out):* `The shot pulls out(Translate_Z_Backward), revealing the person sitting still in a chair.`
+* *(Example for Zoom):* `The shot zooms in(Zoom_In), tightening the frame on the person's static eyes.`
+* *(Example for Dolly Zoom Compress):* `The shot dolly zooms (compressing background)(Dolly_Zoom_Compress), keeping the person's static face framed while the background rushes towards them.`
+* *(Example for Dolly Zoom Expand):* `The shot dolly zooms (expanding background)(Dolly_Zoom_Expand), keeping the person's static face framed while the background stretches away.`
+* *(Example for Static / Pose Change):* `The shot is static(Static), capturing a person as they nod their head in agreement.`
 
-    def __len__(self):
-        return len(self.meta)
-
-    def get_index(self, video_size, num_frames, st=0):
-        seg_size = max(0., float(video_size - 1) / num_frames)
-        max_frame = int(video_size) - 1
-        seq = []
-        # index from 1, must add 1
-        for i in range(num_frames):
-            start = int(np.round(seg_size * i))
-            # end = int(np.round(seg_size * (i + 1)))
-            idx = min(start, max_frame)
-            seq.append(idx+st)
-        return seq
-   
-def result_writer(indices_list: list, result_list: list, meta: pd.DataFrame, column):
-    flat_indices = []
-    for x in zip(indices_list):
-        flat_indices.extend(x)
-    flat_results = []
-    for x in zip(result_list):
-        flat_results.extend(x)
-   
-    flat_indices = np.array(flat_indices)
-    flat_results = np.array(flat_results)
-
-    unique_indices, unique_indices_idx = np.unique(flat_indices, return_index=True)
-    meta.loc[unique_indices, column[0]] = flat_results[unique_indices_idx]
-
-    meta = meta.loc[unique_indices]
-    return meta
-
-
-def worker_init_fn(worker_id):
-    # Set different seed for each worker
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    # Prevent deadlocks by setting timeout
-    torch.set_num_threads(1)
-
-def main():
-    parser = argparse.ArgumentParser(description="SkyCaptioner-V1 vllm batch inference")
-    parser.add_argument("--input_csv", default="./examples/test.csv")
-    parser.add_argument("--out_csv", default="./examples/test_result.csv")
-    parser.add_argument("--bs", type=int, default=4)
-    parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--model_path", required=True, type=str, help="skycaptioner-v1 model path")
-    args = parser.parse_args()
-   
-    dataset = VideoTextDataset(csv_path=args.input_csv, model_path=args.model_path)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.bs,
-        num_workers=4,
-        worker_init_fn=worker_init_fn,
-        persistent_workers=True,
-        timeout=0,
-    )
-
-    sampling_params = SamplingParams(temperature=0.05, max_tokens=2048)
-   
-    llm = LLM(model=args.model_path,
-        gpu_memory_utilization=0.8,
-        max_model_len=4096,
-        tensor_parallel_size=args.tp)
-   
-    indices_list = []
-    caption_save = []
-    for video_batch in tqdm(dataloader):
-        indices = video_batch["index"]
-        inputs = video_batch["input"]
-        batch_user_inputs = []
-        for prompt, video in zip(inputs['prompt'], inputs['multi_modal_data']['video'][0]):
-            usi={'prompt':prompt, 'multi_modal_data':{'video':video}}
-            batch_user_inputs.append(usi)
-        outputs = llm.generate(batch_user_inputs, sampling_params, use_tqdm=False)
-        struct_outputs = [output.outputs[0].text for output in outputs]
-
-        indices_list.extend(indices.tolist())
-        caption_save.extend(struct_outputs)
-
-    meta_new = result_writer(indices_list, caption_save, dataset.meta, column=["structural_caption"])
-    meta_new.to_csv(args.out_csv, index=False)
-    print(f'Saved structural_caption to {args.out_csv}')
-
-if __name__ == '__main__':
-    main()
+**Task:**
+Analyze the video provided and generate a single-line caption that strictly adheres to all format and content rules defined above. Do not provide any other text, explanation, or preamble.
+"""
