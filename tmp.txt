@@ -1,136 +1,208 @@
-1. 希区柯克变焦 (Dolly Zoom)
-中文模板： "将焦段从24mm切换成{}mm的视角，使背景贴近主体，实现空间压缩感，保持主体景别不变"
-
-核心术语： Dolly Zoom (或 Vertigo Effect / Hitchcock Zoom)
-
-英文模板：
-
-"Dolly zoom: camera zooms from 24mm to {focal_length}mm, creating spatial compression while keeping the subject's framing constant."
-
-变量替换示例 (e.g., 70mm):
-
-"Dolly zoom: camera zooms from 24mm to 70mm, creating spatial compression while keeping the subject's framing constant."
-
-2. 上下左右平移 (Translation: Truck / Pedestal)
-这是一个关键的区别：“平移” (píngyí) 在3D空间中指的是相机位置的物理移动 (Translation)，而不是镜头的旋转 (Rotation)。
-
-中文模板： "镜头向{}平移{}分之一屏，保持俯仰不变、人物姿态不变"
-
-核心术语：
-
-左右平移: Truck (left/right)
-
-上下平移: Pedestal (up/down)
-
-变量映射 (Mapping):
-
-{方向}:
-
-"上" -> "pedestal up"
-
-"下" -> "pedestal down"
-
-"左" -> "truck left"
-
-"右" -> "truck right"
-
-{分数}:
-
-"三" -> "one-third"
-
-"五" -> "one-fifth"
-
-英文模板：
-
-"Camera {action} by {fraction} of the screen {dimension}, keeping orientation and subject pose constant."
-
-注意: 我们需要明确是屏幕宽度还是高度。
-
-左右 (Truck) -> width
-
-上下 (Pedestal) -> height
-
-变量替换示例:
-
-中文: "镜头向左平移三分之一屏..."
-
-英文: "Camera truck left by one-third of the screen width, keeping orientation and subject pose constant."
-
-中文: "镜头向上平移五分之一屏..."
-
-英文: "Camera pedestal up by one-fifth of the screen height, keeping orientation and subject pose constant."
-
-3. 俯仰 (Rotation: Tilt)
-中文模板： "将镜头拍摄视角变为{}拍，角度为{}度，保持镜头拍摄位置不变、人物姿态不变"
-
-核心术语： Tilt (up/down)
-
-变量映射 (Mapping):
-
-{方向}:
-
-"俯" -> "tilt down" (从高处看)
-
-"仰" -> "tilt up" (从低处看)
-
-{角度}: "15", "30"
-
-英文模板：
-
-"Camera {action} by {angle} degrees. Keep camera position and subject pose constant."
-
-变量替换示例:
-
-中文: "将镜头拍摄视角变为俯拍，角度为15度..."
-
-英文: "Camera tilt down by 15 degrees. Keep camera position and subject pose constant."
-
-中文: "将镜头拍摄视角变为仰拍，角度为30度..."
-
-英文: "Camera tilt up by 30 degrees. Keep camera position and subject pose constant."
-
-4. 左右旋转 (Rotation: Pan)
-中文模板： "将镜头拍摄视角向{}旋转，角度为{}度，保持镜头拍摄位置不变、人物姿态不变"
-
-核心术语： Pan (left/right)
-
-变量映射 (Mapping):
-
-{方向}:
-
-"左" -> "pan left"
-
-"右" -> "pan right"
-
-{角度}: "15", "30"
-
-英文模板：
-
-"Camera {action} by {angle} degrees. Keep camera position and subject pose constant."
-
-变量替换示例:
-
-中文: "将镜头拍摄视角向左旋转，角度为15度..."
-
-英文: "Camera pan left by 15 degrees. Keep camera position and subject pose constant."
-
-中文: "将镜头拍摄视角向右旋转，角度为30度..."
-
-英文: "Camera pan right by 30 degrees. Keep camera position and subject pose constant."
-
-5. 人物姿态变化 (Subject Pose Change)
-中文模板： "使画面中的人物{}，保持人物ID不变"
-
-核心术语： 这是一个内容变化指令，相机应保持静止。
-
-英文模板：
-
-"The person {action}. Keep identity consistent. Static camera."
-
-注：{action} 部分需要您根据 "人物{}" 的具体动作（例如 "挥手"、"跳跃"）自行翻译。
-
-变量替换示例 (e.g., "挥手"):
-
-中文: "使画面中的人物挥手，保持人物ID不变"
-
-英文: "The person waves their hand. Keep identity consistent. Static camera."
+import torch
+import decord
+import argparse
+import random
+
+import pandas as pd
+import numpy as np
+
+from tqdm import tqdm
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer, AutoProcessor
+
+from torch.utils.data import DataLoader
+
+SYSTEM_PROMPT = "Please imagine the video, and provide a faithfully concise description of the following content:\n" \
+"1. Detailed description of this video in more than three sentences. Here are some examples of good descriptions: 1) A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about. 2) A movie trailer featuring the adventures of the 30 year old space man wearing a red wool knitted motorcycle helmet, blue sky, salt desert, cinematic style, shot on 35mm film, vivid colors.\n" \
+"2. Description of the main subject actions or status sequence. This suggests including the main subjects (person, object, animal, or none) and their attributes, their action, their position, and movements during the video frames.\n" \
+"3. Summary of the background. This should also include the objects, location, weather, and time.\n" \
+"4. Summary of the view shot, camera movement and changes in shooting angles in the sequence of video frames.\n" \
+"5. Briefly one-sentence Summary of the visual, Photographic and artistic style.\n" \
+"No need to provide summary content. Do not describe each frame individually. Do not reply with words like 'first frame'. The description should be useful for AI to re-generate the video."
+
+
+class VideoTextDataset(torch.utils.data.Dataset):
+    def __init__(self, csv_path, model_path):
+        if isinstance(csv_path, pd.DataFrame):
+            self.meta = csv_path
+        else:
+            self.meta = pd.read_csv(csv_path)
+        self._path = 'path'
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.processor = AutoProcessor.from_pretrained(model_path)
+
+        print(len(self.meta))
+ 
+    def __getitem__(self, index):
+        try:
+            row = self.meta.iloc[index]
+            path = row[self._path]
+            real_index = self.meta.index[index]
+            vr = decord.VideoReader(path, ctx=decord.cpu(0), width=360, height=420)
+            start = 0
+            end = len(vr)
+            # avg_fps = vr.get_avg_fps()
+            index = self.get_index(end-start, 16, st=start)
+            frames = vr.get_batch(index).asnumpy() # n h w c
+            video_inputs = [torch.from_numpy(frames).permute(0, 3, 1, 2)]
+            conversation = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video",
+                                "video": row['path'],
+                                "max_pixels": 360 * 420, # 460800
+                                "fps": 2.0,
+                            },
+                            {  
+                                "type": "text",
+                                "text": SYSTEM_PROMPT
+                            },
+                        ],
+                    }
+                   
+            # 生成 user_input
+            user_input = self.processor.apply_chat_template(
+                [conversation],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            results = dict()
+            inputs = {
+                'prompt': user_input,
+                'multi_modal_data': {'video': video_inputs}
+            }
+            results["index"] = real_index
+            results['input'] = inputs
+            return results
+        except Exception as e:
+            index = random.randint(0, len(self.meta)-1)
+            row = self.meta.iloc[index]
+            path = row[self._path]
+            real_index = self.meta.index[index]
+            vr = decord.VideoReader(path, ctx=decord.cpu(0), width=360, height=420)
+            start = 0
+            end = len(vr)
+            # avg_fps = vr.get_avg_fps()
+            index = self.get_index(end-start, 16, st=start)
+            frames = vr.get_batch(index).asnumpy() # n h w c
+            video_inputs = [torch.from_numpy(frames).permute(0, 3, 1, 2)]
+            conversation = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video",
+                                "video": row['path'],
+                                "max_pixels": 360 * 420, # 460800
+                                "fps": 4.0,
+                            },
+                            {  
+                                "type": "text",
+                                "text": SYSTEM_PROMPT
+                            },
+                        ],
+                    }
+                   
+            # 生成 user_input
+            user_input = self.processor.apply_chat_template(
+                [conversation],
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            results = dict()
+            inputs = {
+                'prompt': user_input,
+                'multi_modal_data': {'video': video_inputs}
+            }
+            results["index"] = real_index
+            results['input'] = inputs
+            return results
+
+
+    def __len__(self):
+        return len(self.meta)
+
+    def get_index(self, video_size, num_frames, st=0):
+        seg_size = max(0., float(video_size - 1) / num_frames)
+        max_frame = int(video_size) - 1
+        seq = []
+        # index from 1, must add 1
+        for i in range(num_frames):
+            start = int(np.round(seg_size * i))
+            # end = int(np.round(seg_size * (i + 1)))
+            idx = min(start, max_frame)
+            seq.append(idx+st)
+        return seq
+   
+def result_writer(indices_list: list, result_list: list, meta: pd.DataFrame, column):
+    flat_indices = []
+    for x in zip(indices_list):
+        flat_indices.extend(x)
+    flat_results = []
+    for x in zip(result_list):
+        flat_results.extend(x)
+   
+    flat_indices = np.array(flat_indices)
+    flat_results = np.array(flat_results)
+
+    unique_indices, unique_indices_idx = np.unique(flat_indices, return_index=True)
+    meta.loc[unique_indices, column[0]] = flat_results[unique_indices_idx]
+
+    meta = meta.loc[unique_indices]
+    return meta
+
+
+def worker_init_fn(worker_id):
+    # Set different seed for each worker
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    # Prevent deadlocks by setting timeout
+    torch.set_num_threads(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="SkyCaptioner-V1 vllm batch inference")
+    parser.add_argument("--input_csv", default="./examples/test.csv")
+    parser.add_argument("--out_csv", default="./examples/test_result.csv")
+    parser.add_argument("--bs", type=int, default=4)
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--model_path", required=True, type=str, help="skycaptioner-v1 model path")
+    args = parser.parse_args()
+   
+    dataset = VideoTextDataset(csv_path=args.input_csv, model_path=args.model_path)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.bs,
+        num_workers=4,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=True,
+        timeout=0,
+    )
+
+    sampling_params = SamplingParams(temperature=0.05, max_tokens=2048)
+   
+    llm = LLM(model=args.model_path,
+        gpu_memory_utilization=0.8,
+        max_model_len=4096,
+        tensor_parallel_size=args.tp)
+   
+    indices_list = []
+    caption_save = []
+    for video_batch in tqdm(dataloader):
+        indices = video_batch["index"]
+        inputs = video_batch["input"]
+        batch_user_inputs = []
+        for prompt, video in zip(inputs['prompt'], inputs['multi_modal_data']['video'][0]):
+            usi={'prompt':prompt, 'multi_modal_data':{'video':video}}
+            batch_user_inputs.append(usi)
+        outputs = llm.generate(batch_user_inputs, sampling_params, use_tqdm=False)
+        struct_outputs = [output.outputs[0].text for output in outputs]
+
+        indices_list.extend(indices.tolist())
+        caption_save.extend(struct_outputs)
+
+    meta_new = result_writer(indices_list, caption_save, dataset.meta, column=["structural_caption"])
+    meta_new.to_csv(args.out_csv, index=False)
+    print(f'Saved structural_caption to {args.out_csv}')
+
+if __name__ == '__main__':
+    main()
