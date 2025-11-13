@@ -1,49 +1,140 @@
-# [VLM引导描述 PROMPT]
-# 目的: 您提供运镜代码, VLM负责格式化前缀并填充内容描述。
-VLM_GUIDED_PROMPT = """You are an AI video captioning assistant. Your task is to generate a single-line caption for a video.
+import math
+import json
+import os
+# ... (你其他的 import)
 
-I will provide you with a video and a **MOTION_CODE**.
+def process_case(pipeline, device, case, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight, save_path, seed, not_use_lora, different_lora):
+    generator = torch.Generator(device=device).manual_seed(seed)
+    
+    # 准备变量
+    input_image_path_to_use = None
+    # 'sample_size' (例如 832*480) 现在只作为预处理失败时的*回退*选项
+    current_sample_size = sample_size 
+    
+    # --- [关键修改: 动态分辨率处理] ---
+    try:
+        # 1. 设定约束
+        max_pixels = 1280 * 720  # 约 92 万像素
+        vae_scale_factor = 8
 
-You **must** follow these two rules:
+        # 2. 加载原始图像并获取尺寸
+        with Image.open(case['start_image']) as image:
+            image = image.convert('RGB')
+            original_width, original_height = image.size
 
-**1. Generate the Caption Prefix (Prefix Generation):**
-You must use the MOTION_CODE I provide to create the *first part* of the caption, using the exact mapping below.
+        # 3. 计算新尺寸
+        current_pixels = original_width * original_height
+        
+        if current_pixels > max_pixels:
+            aspect_ratio = original_width / original_height
+            # a. 计算缩放后的理想尺寸
+            new_height = math.sqrt(max_pixels / aspect_ratio)
+            new_width = new_height * aspect_ratio
+        else:
+            # b. 无需缩放
+            new_height = original_height
+            new_width = original_width
 
-**2. Generate the Content Description (Content Generation):**
-You must then watch the video and write a concise, one-sentence description of the video's main content (subject, setting, or action).
+        # 4. [关键] 将理想尺寸四舍五入到 8 的倍数
+        final_height = int(round(new_height / vae_scale_factor) * vae_scale_factor)
+        final_width = int(round(new_width / vae_scale_factor) * vae_scale_factor)
 
-**--- Prefix Mapping (Strict) ---**
+        # 5. 确保尺寸不为0
+        if final_height == 0: final_height = vae_scale_factor
+        if final_width == 0: final_width = vae_scale_factor
 
-* `Static` -> `The shot is static(Static),`
-* `Pan_Left` -> `The shot pans left(Pan_Left),`
-* `Pan_Right` -> `The shot pans right(Pan_Right),`
-* `Tilt_Up` -> `The shot tilts up(Tilt_Up),`
-* `Tilt_Down` -> `The shot tilts down(Tilt_Down),`
-* `Pedestal_Up` -> `The shot pedestals up(Pedestal_Up),`
-* `Pedestal_Down` -> `The shot pedestals down(Pedestal_Down),`
-* `Truck_Left` -> `The shot trucks left(Truck_Left),`
-* `Truck_Right` -> `The shot trucks right(Truck_Right),`
-* `Translate_Z_Forward` -> `The shot dollies in(Translate_Z_Forward),`
-* `Translate_Z_Backward` -> `The shot pulls out(Translate_Z_Backward),`
-* `Zoom_In` -> `The shot zooms in(Zoom_In),`
-* `Zoom_Out` -> `The shot zooms out(Zoom_Out),`
-* `Dolly_Zoom_Compress` -> `The shot dolly zooms (compressing background)(Dolly_Zoom_Compress),`
-* `Dolly_Zoom_Expand` -> `The shot dolly zooms (expanding background)(Dolly_Zoom_Expand),`
+        # 6. [关键] 更新 'current_sample_size' 以便 pipeline 使用
+        current_sample_size = [final_height, final_width]
+        target_size_pil = (final_width, final_height)
 
-**--- Examples ---**
+        # 7. 将原始图像 resize 到这个最终尺寸 (无裁剪, 无黑边)
+        #    我们重新打开图像以防万一
+        with Image.open(case['start_image']) as image_to_resize:
+             image_to_resize = image_to_resize.convert('RGB')
+             processed_image = image_to_resize.resize(target_size_pil, Image.Resampling.LANCZOS)
 
-**Example 1:**
-* **My Input:** `MOTION_CODE: Pan_Right` and a [video of a static person].
-* **Your Output:** `The shot pans right(Pan_Right), moving across the person's static face from left to right.`
+        # 8. [不变] 保存到临时文件
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_f:
+            processed_image.save(temp_f.name)
+            input_image_path_to_use = temp_f.name
 
-**Example 2:**
-* **My Input:** `MOTION_CODE: Static` and a [video of a person waving].
-* **Your Output:** `The shot is static(Static), capturing a person as they wave their hand.`
+    except Exception as e:
+        print(f"警告: 图像动态分辨率处理失败 {case['start_image']}。错误: {e}")
+        print(f"将回退到使用默认尺寸 {sample_size} 并可能拉伸。")
+        # 回退：使用原始路径和默认的 sample_size
+        input_image_path_to_use = case['start_image']
+        current_sample_size = sample_size # 确保回退时尺寸正确
+    # --- [修改结束] ---
 
-**Example 3:**
-* **My Input:** `MOTION_CODE: Dolly_Zoom_Compress` and a [video of a dolly zoom].
-* **Your Output:** `The shot dolly zooms (compressing background)(Dolly_Zoom_Compress), keeping the person's static face framed while the background rushes towards them.`
+    
+    # [推理部分]
+    try:
+        if different_lora:
+            # Merge LoRA
+            if case.get('lora_path') and not not_use_lora:
+                pipeline = merge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+            
+            with torch.no_grad():
+                latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+                # [修改] 使用 'input_image_path_to_use' (路径)
+                # [修改] 使用动态计算的 'current_sample_size'
+                input_video, input_video_mask, clip_image = get_image_to_video_latent(
+                    input_image_path_to_use, None, video_length=video_length, 
+                    sample_size=current_sample_size 
+                )
 
-**Task:**
-Wait for my input, which will contain the MOTION_CODE and the video. Then, generate the single-line caption. Do not provide any other text.
-"""
+                sample = pipeline(
+                    case['prompt'], 
+                    num_frames=video_length,
+                    negative_prompt=negative_prompt,
+                    # [修改] 使用动态的高度和宽度
+                    height=current_sample_size[0],
+                    width=current_sample_size[1],
+                    generator=generator,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    video=input_video,
+                    mask_video=input_video_mask,
+                    clip_image=clip_image,
+                    shift=shift,
+                ).videos
+            
+            # Unmerge LoRA
+            if case.get('lora_path'):
+                pipeline = unmerge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+
+        else:
+            with torch.no_grad():
+                latent_frames = (video_length - 1) // pipeline.vae.config.temporal_compression_ratio + 1
+                
+                # [修改] (同样) 使用 'input_image_path_to_use' 和 'current_sample_size'
+                input_video, input_video_mask, clip_image = get_image_to_video_latent(
+                    input_image_path_to_use, None, video_length=video_length, 
+                    sample_size=current_sample_size
+                )
+
+                sample = pipeline(
+                    case['prompt'], 
+                    num_frames=video_length,
+                    negative_prompt=negative_prompt,
+                    # [修改] (同样) 使用动态的高度和宽度
+                    height=current_sample_size[0],
+                    width=current_sample_size[1],
+                    generator=generator,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    video=input_video,
+                    mask_video=input_video_mask,
+                    clip_image=clip_image,
+                    shift=shift,
+                ).videos
+        
+        return sample
+
+    finally:
+        # [不变] 清理临时文件
+        if input_image_path_to_use and input_image_path_to_use != case['start_image']:
+            if os.path.exists(input_image_path_to_use):
+                os.remove(input_image_path_to_use)
+                # print(f"已删除临时文件: {input_image_path_to_use}")
