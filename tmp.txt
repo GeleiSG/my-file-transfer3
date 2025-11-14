@@ -1,137 +1,77 @@
-import json
-import os
+# [VLM 拼接式标注 PROMPT]
+# 目的: VLM 观看视频, 仅生成中间的内容描述, 然后将其拼接到您提供的模板中。
+VLM_CLOZE_PROMPT = """You are an AI video captioning assistant. Your sole task is to generate a single-line caption for a video by **stitching** a content description into a predefined template.
 
-# 预设的prompt后缀字典 (保持不变)
-PROMPT_SUFFIXES = {
-    "cr34sh_zoom_in": ". The camera performs a cr34sh crash zoom in effect, slowly and steadily moves forward toward the subject to emphasize detail.",
-    "cr34sh_zoom_out" : ". The camera performs a cr34sh crash zoom out effect, slowly and steadily moves backward to show more of the environment.",
-    "cr4n3_crane_down" : ". The camera performs a cr4n3 crane down camera motion slowly lowers the perspective.",
-    "cr4n3_crane_up" : ". The camera performs a cr4n3 crane over the head movement, smoothly rising higher and tilting downwards.",
-    "0rb4it 360 degree":". The camera smoothly performs an 0rb4it 360 degree orbit, rotate around the subject for a full-scale perspective.",
-    "l3ft_truck_left" : ". The camera performs a l3ft traverls left effect, the camera slowly and horizontally moves left to reveal new elements in the scene.",
-    "l3ft_truck_right" : ". The camera performs a l3ft traverls left effect, slowly and horizontally moves left to reveal new elements in the scene.",
-    "zoom_in": ". The camera performs a abs0lut3lly_st34dy zoom in effect, moving forward toward the subject to emphasize detail.",
-    "zoom_out": "The camera performs a st34d1ly zoom out effect, the camera slowly and steadily moves back away from the subject to reveal new elements in the scene.",
-    "rotate": "The camera orbits around the subject with a smooth 360-degree rotation.",
-    "abstract": "The scene transitions through surreal color gradients and geometric distortions.",
+**Your task is rigid and simple:**
 
-    "default": ["" ," The video captures the subject in cinematic 4K resolution."],
-    "static" : ["[Static] The shot starts on ", ". Static shot, fixed camera, no camera movement. The camera remains locked-down, the shot presenting the scene with a stable, painting-like composition."],
-    "truckRight": ["[Truck Right] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene."],
-    "truckLeft" : ["[Truck Left] The shot starts on ", ". immediately, the camera performs a steaabs0lut3lly_st34dydy travels left effect, the shot slowly and horizontally moving left to reveal new elements on the left of the scene."],
-    "pedestalUp" : ["[Pedestal Up] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy dolly up effect, the shot slowly and vertically moving up to reveal the scene from a higher perspective."],
-    "pedestalDown" : ["[Pedestal Down] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy dolly down effect, the shot slowly and vertically moving down to reveal new elements on the bottom of the scene."],
-    "zoomin" : ["[Zoom In] The shot starts on ", ", immediately, the camera performs a abs0lut3lly_st34dy zoom in effect, the shot making the subject appear larger in the frame by adjusting the lens, creating a sense of focus."],
-    "zoomout" : ["[Zoom Out] The shot starts on ", ", immediately, the camera performs a abs0lut3lly_st34dy zoom out effect, the shot making the subject appear smaller in the frame by adjusting the lens, revealing its surrounding context and environment."],
-    "rotate" : ["[Arc 30-30]", "The camera executes a precise orbit around the subject, arcing 30 degrees horizontally and 30 degrees vertically."],
-    
-    "new_truckLeft": ["The shot trucks left, revealing ", ""],
-    "new_pedestalDown" : ["The shot pedestals down, revealing ", ""],
-    
-}
+1.  I will provide you with a **MOTION_CODE** and a **video**.
+2.  You will watch the video and generate a concise, factual description of the **main subject** (e.g., "a woman with brown hair sitting in a cafe" or "a close-up of a person's face").
+3.  You will then take this description and insert it into the **exact** template defined by the MOTION_CODE.
+4.  Your final output must be **only** the single, complete line of text.
 
-def generate_separate_json_files(input_file, output_dir, lora_path, base_path="", prompt_keys=None):
-    """
-    为每个prompt_key(方向)生成一个独立的JSON文件。
-    输出文件名格式为：[输入文件名]_[方向名].json
+**--- Template Mapping (Strict) ---**
 
-    Args:
-        input_file (str): 输入的JSON文件路径。
-        output_dir (str): 输出文件存放的目录。
-        lora_path (str): 用户指定的LoRA模型路径。
-        base_path (str): start_image的基础路径 (可选)。
-        prompt_keys (list): 需要处理的prompt key列表。如果为None，则处理PROMPT_SUFFIXES中所有key。
-    """
-    selected_idx = [9,10,11,12,13,14,32,33,40,64,65,66,69,71,72,74,75,78,108,109,111,113,114,115,170,172,174,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,289,290,295,287]
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
-    
-    with open(input_file, 'r') as f:
-        data_list = json.load(f)
-    
-    # 统一处理为列表形式
-    if not isinstance(data_list, list):
-        data_list = [data_list]
+You **must** use this exact template mapping. The final caption is:
+`[PREFIX]` + `[Your Content Description]` + `[SUFFIX]`
 
-    filtered_data_list = []
-    for i in range(len(data_list)):
-        if i in selected_idx:
-            filtered_data_list.append(data_list[i])
+* **MOTION_CODE:** `static`
+    * **Prefix:** `[Static] The shot starts on `
+    * **Suffix:** `. Static shot, fixed camera, no camera movement. The camera remains locked-down, the shot presenting the scene with a stable, painting-like composition.`
 
-    # 如果未指定prompt_keys，则使用字典中所有的keys
-    if prompt_keys is None:
-        prompt_keys = list(PROMPT_SUFFIXES.keys())
+* **MOTION_CODE:** `truckRight`
+    * **Prefix:** `[Truck Right] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene.`
 
-    # 获取输入文件的基本名称（不含扩展名）
-    input_filename_base = os.path.splitext(os.path.basename(input_file))[0]
+* **MOTION_CODE:** `truckLeft`
+    * **Prefix:** `[Truck Left] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a steaabs0lut3lly_st34dydy travels left effect, the shot slowly and horizontally moving left to reveal new elements on the left of the scene.`
 
-    # 为每个prompt_key生成一个文件
-    for prompt_key in prompt_keys:
-        new_data_list_for_key = []
-        suffix = PROMPT_SUFFIXES.get(prompt_key)
+* **MOTION_CODE:** `pedestalUp`
+    * **Prefix:** `[Pedestal Up] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly up effect, the shot slowly and vertically moving up to reveal the scene from a higher perspective.`
 
-        if suffix is None:
-            print(f"警告：在PROMPT_SUFFIXES中未找到 '{prompt_key}'，已跳过。")
-            continue
+* **MOTION_CODE:** `pedestalDown`
+    * **Prefix:** `[Pedestal Down] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly down effect, the shot slowly and vertically moving down to reveal new elements on the bottom of the scene.`
 
-        for data in filtered_data_list:
-            # 拼接完整prompt
-            full_prompt = f"{suffix[0]}{data['caption']}{suffix[1]}"
-            
-            # 处理start_image路径
-            start_image = data["file_name"]
-            if base_path:
-                start_image = os.path.join(base_path, start_image)
-            
-            new_data = {
-                "lora_path": lora_path,
-                "start_image": start_image,
-                "prompt": full_prompt
-            }
-            new_data_list_for_key.append(new_data)
-        
-        # 构建输出文件路径
-        output_filename = f"{input_filename_base}_{prompt_key}.json"
-        output_filepath = os.path.join(output_dir, output_filename)
-        
-        # 写入独立的JSON文件
-        with open(output_filepath, 'w') as f:
-            # 如果只有一个元素，则直接写入对象，否则写入列表
-            if len(new_data_list_for_key) == 1:
-                json.dump(new_data_list_for_key[0], f, indent=4)
-            else:
-                json.dump(new_data_list_for_key, f, indent=4)
-        
-        print(f"成功生成文件: {output_filepath}")
+* **MOTION_CODE:** `zoomin`
+    * **Prefix:** `[Zoom In] The shot starts on `
+    * **Suffix:** `, immediately, the camera performs a abs0lut3lly_st34dy zoom in effect, the shot making the subject appear larger in the frame by adjusting the lens, creating a sense of focus.`
 
-# --- 使用示例 ---
-if __name__ == "__main__":
-    input_json = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/examples/wan2.1/configs/data/i2v-bench-info.json"
-    
-    # 将输出路径改为一个目录
-    output_directory = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/7direction_multicase_test"
-    
-    lora_path = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/output_dir_14b_0911_7_direction/checkpoint-3000.safetensors"
-    base_path = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/examples/wan2.1/configs/data/crop/16-9"
-    
-    # 定义你想要生成的所有方向
-    directions_to_generate = [
-        "static", 
-        "truckRight", 
-        "truckLeft", 
-        "pedestalUp", 
-        "pedestalDown", 
-        "zoomin", 
-        "zoomout",
-        "new_truckLeft",
-        "new_pedestalDown"
-    ]
-    
-    # 调用新函数
-    generate_separate_json_files(
-        input_file=input_json, 
-        output_dir=output_directory, 
-        lora_path=lora_path, 
-        base_path=base_path,
-        prompt_keys=directions_to_generate
-    )
+* **MOTION_CODE:** `zoomout`
+    * **Prefix:** `[Zoom Out] The shot starts on `
+    * **Suffix:** `, immediately, the camera performs a abs0lut3lly_st34dy zoom out effect, the shot making the subject appear smaller in the frame by adjusting the lens, revealing its surrounding context and environment.`
+
+* **MOTION_CODE:** `panLeft`
+    * **Prefix:** `[Pan Left] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy pan left effect, the shot slowly and horizontally rotating left from a fixed position to show elements on the left of the scene.`
+
+* **MOTION_CODE:** `panRight`
+    * **Prefix:** `[Pan Right] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy pan right effect, the shot slowly and horizontally rotating right from a fixed position to show elements on the right of the scene.`
+
+* **MOTION_CODE:** `tiltUp`
+    * **Prefix:** `[Tilt Up] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy tilt up effect, the shot slowly and vertically rotating upwards from a fixed position to reveal the scene from a higher angle.`
+
+* **MOTION_CODE:** `tiltDown`
+    * **Prefix:** `[Tilt Down] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy tilt down effect, the shot slowly and vertically rotating downwards from a fixed position to reveal new elements on the bottom of the scene.`
+
+* **MOTION_CODE:** `dollyZoomCompress`
+    * **Prefix:** `[Dolly Zoom Compress] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly zoom effect, simultaneously zooming in while dollying out, keeping the subject's framing constant while dramatically compressing the background, making it appear closer.`
+
+* **MOTION_CODE:** `dollyZoomExpand`
+    * **Prefix:** `[Dolly Zoom Expand] The shot starts on `
+    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly zoom effect, simultaneously zooming out while dollying in, keeping the subject's framing constant while dramatically expanding the background, creating a vertigo effect as the background stretches away.`
+
+**--- Examples of Your Final Output ---**
+
+* *(Input: `MOTION_CODE: truckRight` + [video])*
+    **Your Output:** `[Truck Right] The shot starts on a woman in a blue jacket. immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene.`
+
+* *(Input: `MOTION_CODE: tiltUp` + [video])*
+    **Your Output:** `[Tilt Up] The shot starts on a man's hands on a keyboard. immediately, the camera performs a abs0lut3lly_st34dy tilt up effect, the shot slowly and vertically rotating upwards from a fixed position to reveal the scene from a higher angle.`
+
+**--- Your Task ---**
