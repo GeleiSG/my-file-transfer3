@@ -1,133 +1,137 @@
-# [VLM 中文指令转英文描述 PROMPT]
-# 目的: VLM读取图像和中文指令, 输出一个融合了图像内容的英文prompt
-VLM_PROMPT_GENERATOR = """You are an expert prompt engineer for AI video generation models. Your task is to create a single-line English prompt by combining visual information from an image (the starting frame) and a technical CHINESE_INSTRUCTION.
+import json
+import os
 
-**Your Process MUST be:**
-1.  **Analyze the Image:** Look at the image and create a concise English description of the main subject (e.g., "a woman with brown hair wearing a blue shirt", "a man with glasses and a beard").
-2.  **Analyze the Instruction:** Read the CHINESE_INSTRUCTION and convert it into the corresponding **English Motion Prefix** using the strict mapping below.
-3.  **Synthesize:** Combine the English prefix (from Step 2) and the content description (from Step 1) into a single, coherent English sentence.
+# 预设的prompt后缀字典 (保持不变)
+PROMPT_SUFFIXES = {
+    "cr34sh_zoom_in": ". The camera performs a cr34sh crash zoom in effect, slowly and steadily moves forward toward the subject to emphasize detail.",
+    "cr34sh_zoom_out" : ". The camera performs a cr34sh crash zoom out effect, slowly and steadily moves backward to show more of the environment.",
+    "cr4n3_crane_down" : ". The camera performs a cr4n3 crane down camera motion slowly lowers the perspective.",
+    "cr4n3_crane_up" : ". The camera performs a cr4n3 crane over the head movement, smoothly rising higher and tilting downwards.",
+    "0rb4it 360 degree":". The camera smoothly performs an 0rb4it 360 degree orbit, rotate around the subject for a full-scale perspective.",
+    "l3ft_truck_left" : ". The camera performs a l3ft traverls left effect, the camera slowly and horizontally moves left to reveal new elements in the scene.",
+    "l3ft_truck_right" : ". The camera performs a l3ft traverls left effect, slowly and horizontally moves left to reveal new elements in the scene.",
+    "zoom_in": ". The camera performs a abs0lut3lly_st34dy zoom in effect, moving forward toward the subject to emphasize detail.",
+    "zoom_out": "The camera performs a st34d1ly zoom out effect, the camera slowly and steadily moves back away from the subject to reveal new elements in the scene.",
+    "rotate": "The camera orbits around the subject with a smooth 360-degree rotation.",
+    "abstract": "The scene transitions through surreal color gradients and geometric distortions.",
 
-**--- Motion Prefix Mapping (Strict) ---**
+    "default": ["" ," The video captures the subject in cinematic 4K resolution."],
+    "static" : ["[Static] The shot starts on ", ". Static shot, fixed camera, no camera movement. The camera remains locked-down, the shot presenting the scene with a stable, painting-like composition."],
+    "truckRight": ["[Truck Right] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene."],
+    "truckLeft" : ["[Truck Left] The shot starts on ", ". immediately, the camera performs a steaabs0lut3lly_st34dydy travels left effect, the shot slowly and horizontally moving left to reveal new elements on the left of the scene."],
+    "pedestalUp" : ["[Pedestal Up] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy dolly up effect, the shot slowly and vertically moving up to reveal the scene from a higher perspective."],
+    "pedestalDown" : ["[Pedestal Down] The shot starts on ", ". immediately, the camera performs a abs0lut3lly_st34dy dolly down effect, the shot slowly and vertically moving down to reveal new elements on the bottom of the scene."],
+    "zoomin" : ["[Zoom In] The shot starts on ", ", immediately, the camera performs a abs0lut3lly_st34dy zoom in effect, the shot making the subject appear larger in the frame by adjusting the lens, creating a sense of focus."],
+    "zoomout" : ["[Zoom Out] The shot starts on ", ", immediately, the camera performs a abs0lut3lly_st34dy zoom out effect, the shot making the subject appear smaller in the frame by adjusting the lens, revealing its surrounding context and environment."],
+    "rotate" : ["[Arc 30-30]", "The camera executes a precise orbit around the subject, arcing 30 degrees horizontally and 30 degrees vertically."],
+    
+    "new_truckLeft": ["The shot trucks left, revealing ", ""],
+    "new_pedestalDown" : ["The shot pedestals down, revealing ", ""],
+    
+}
 
-You **MUST** convert the Chinese instruction into one of these exact English prefixes:
+def generate_separate_json_files(input_file, output_dir, lora_path, base_path="", prompt_keys=None):
+    """
+    为每个prompt_key(方向)生成一个独立的JSON文件。
+    输出文件名格式为：[输入文件名]_[方向名].json
 
-* **中文 (平移):** "镜头向**上**平移**三**分之一屏..."
-    * **英文:** `The shot pedestals up by one-third of the screen height,`
-* **中文 (平移):** "镜头向**下**平移**三**分之一屏..."
-    * **英文:** `The shot pedestals down by one-third of the screen height,`
-* **中文 (平移):** "镜头向**左**平移**三**分之一屏..."
-    * **英文:** `The shot trucks left by one-third of the screen width,`
-* **中文 (平移):** "镜头向**右**平移**三**分之一屏..."
-    * **英文:** `The shot trucks right by one-third of the screen width,`
-* **中文 (旋转-俯仰):** "将镜头拍摄视角变为**俯**拍，角度为**30**°..."
-    * **英文:** `The shot tilts down by 30 degrees,`
-* **中文 (旋转-俯仰):** "将镜头拍摄视角变为**仰**拍，角度为**30**°..."
-    * **英文:** `The shot tilts up by 30 degrees,`
-* **中文 (旋转-摇镜):** "将镜头拍摄视角向**左**旋转，角度为**30**°..."
-    * **英文:** `The shot pans left by 30 degrees,`
-* **中文 (希区柯克):** "希区柯克变焦，背景压缩..." (或 "将焦段...使背景贴近...")
-    * **英文:** `The shot dolly zooms (compressing background),`
-* **中文 (希区柯K):** "希区柯克变焦，背景拉伸..." (或 "将焦段...使背景远离...")
-    * **英文:** `The shot dolly zooms (expanding background),`
-* **中文 (人物姿态变化):** "使画面中的人物**抬头**..." (或 "点头", "挥手" 等)
-    * **英文:** `The shot is static,`
+    Args:
+        input_file (str): 输入的JSON文件路径。
+        output_dir (str): 输出文件存放的目录。
+        lora_path (str): 用户指定的LoRA模型路径。
+        base_path (str): start_image的基础路径 (可选)。
+        prompt_keys (list): 需要处理的prompt key列表。如果为None，则处理PROMPT_SUFFIXES中所有key。
+    """
+    selected_idx = [9,10,11,12,13,14,32,33,40,64,65,66,69,71,72,74,75,78,108,109,111,113,114,115,170,172,174,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,289,290,295,287]
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(input_file, 'r') as f:
+        data_list = json.load(f)
+    
+    # 统一处理为列表形式
+    if not isinstance(data_list, list):
+        data_list = [data_list]
 
-**--- Synthesis Rule (CRITICAL) ---**
+    filtered_data_list = []
+    for i in range(len(data_list)):
+        if i in selected_idx:
+            filtered_data_list.append(data_list[i])
 
-* **If the motion is (Static):** Your content description should describe the **action** (e.g., "...as a person looks up at the camera.").
-* **If the motion is (Pan, Tilt, Pedestal, etc.):** Your content description should describe the **static subject** (e.g., "...showing a person with brown hair standing still.").
+    # 如果未指定prompt_keys，则使用字典中所有的keys
+    if prompt_keys is None:
+        prompt_keys = list(PROMPT_SUFFIXES.keys())
 
-**--- Examples (Your Goal) ---**
+    # 获取输入文件的基本名称（不含扩展名）
+    input_filename_base = os.path.splitext(os.path.basename(input_file))[0]
 
-* **Input:**  + "CHINESE_INSTRUCTION: 镜头向上平移三分之一屏，保持俯仰不变、人物姿态不变。"
-* **Your Output:** `The shot pedestals up by one-third of the screen height, focusing on a man with glasses and a beard standing still.`
+    # 为每个prompt_key生成一个文件
+    for prompt_key in prompt_keys:
+        new_data_list_for_key = []
+        suffix = PROMPT_SUFFIXES.get(prompt_key)
 
-* **Input:**  + "CHINESE_INSTRUCTION: 使画面中的人物抬头，使人脸直视镜头，保持人物ID不变。"
-* **Your Output:** `The shot is static, as a woman with blonde hair looks up to face the camera.`
+        if suffix is None:
+            print(f"警告：在PROMPT_SUFFIXES中未找到 '{prompt_key}'，已跳过。")
+            continue
 
-* **Input:**  + "CHINESE_INSTRUCTION: 将镜头拍摄视角变为俯拍，角度为30°，保持镜头拍摄位置不变、人物姿态不变。"
-* **Your Output:** `The shot tilts down by 30 degrees, looking at a man in a red shirt who is sitting still.`
-
-**--- Your Task ---**
-You will now receive an image and a CHINESE_INSTRUCTION. Generate the single-line English prompt exactly as shown in the examples. Do not provide any other text.
-"""
-
-
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-
-# --- 1. 定义您的 "系统" PROMPT ---
-VLM_PROMPT_GENERATOR = """You are an expert prompt engineer...[此处省略，请将上面完整的prompt字符串复制到这里]...Do not provide any other text.
-"""
-
-# --- 2. 加载模型和处理器 ---
-print("Loading model and processor...")
-# default: Load the model on the available device(s)
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen3-VL-8B-Instruct", dtype="auto", device_map="auto"
-)
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
-print("Model and processor loaded.")
-
-# --- 3. 准备您的数据 ---
-# !! 重要：在此处设置您的图像和对应的中文指令
-image_path = "path/to/your/image_01.jpg"  # <-- 替换为您的图像路径
-chinese_instruction = "镜头向上平移三分之一屏，保持俯仰不变、人物姿态不变。" # <-- 替换为对应的中文指令
-
-# --- 4. 构建 VLM 的 messages ---
-# 这是关键步骤。我们将系统指令、图像和中文指令全部放入一个 "user" turn 中。
-messages = [
-    {
-        "role": "user",
-        "content": [
-            # 第一部分：VLM的 "系统指令" (规则、映射和示例)
-            {
-                "type": "text",
-                "text": VLM_PROMPT_GENERATOR
-            },
+        for data in filtered_data_list:
+            # 拼接完整prompt
+            full_prompt = f"{suffix[0]}{data['caption']}{suffix[1]}"
             
-            # 第二部分：图像数据
-            {
-                "type": "image", 
-                "image": image_path  # 使用您的本地图像路径
-            },
+            # 处理start_image路径
+            start_image = data["file_name"]
+            if base_path:
+                start_image = os.path.join(base_path, start_image)
             
-            # 第三部分：针对此图像的 "中文指令"
-            {
-                "type": "text", 
-                "text": f"CHINESE_INSTRUCTION: {chinese_instruction}"
+            new_data = {
+                "lora_path": lora_path,
+                "start_image": start_image,
+                "prompt": full_prompt
             }
-        ],
-    }
-]
+            new_data_list_for_key.append(new_data)
+        
+        # 构建输出文件路径
+        output_filename = f"{input_filename_base}_{prompt_key}.json"
+        output_filepath = os.path.join(output_dir, output_filename)
+        
+        # 写入独立的JSON文件
+        with open(output_filepath, 'w') as f:
+            # 如果只有一个元素，则直接写入对象，否则写入列表
+            if len(new_data_list_for_key) == 1:
+                json.dump(new_data_list_for_key[0], f, indent=4)
+            else:
+                json.dump(new_data_list_for_key, f, indent=4)
+        
+        print(f"成功生成文件: {output_filepath}")
 
-# --- 5. 准备推理 ---
-print(f"Processing image: {image_path} with instruction: {chinese_instruction}")
-inputs = processor.apply_chat_template(
-    messages,
-    tokenize=True,
-    add_generation_prompt=True,
-    return_dict=True,
-    return_tensors="pt"
-)
-inputs = inputs.to(model.device)
-
-# --- 6. 生成英文 Prompt ---
-print("Generating English prompt...")
-generated_ids = model.generate(**inputs, max_new_tokens=128) # max_new_tokens可能需要调整
-generated_ids_trimmed = [
-    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-]
-output_text_list = processor.batch_decode(
-    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-)
-
-# --- 7. 打印结果 ---
-print("\n--- Generated English Prompt ---")
-if output_text_list:
-    # 打印VLM的最终输出
-    print(output_text_list[0])
-else:
-    print("Error: No output generated.")
-
-# 预期的输出 (示例):
-# The shot pedestals up by one-third of the screen height, focusing on a [VLM对图像的描述] standing still.
+# --- 使用示例 ---
+if __name__ == "__main__":
+    input_json = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/examples/wan2.1/configs/data/i2v-bench-info.json"
+    
+    # 将输出路径改为一个目录
+    output_directory = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/7direction_multicase_test"
+    
+    lora_path = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/output_dir_14b_0911_7_direction/checkpoint-3000.safetensors"
+    base_path = "/mnt/data/ssd/user_workspace/duanke/VideoX-Fun/examples/wan2.1/configs/data/crop/16-9"
+    
+    # 定义你想要生成的所有方向
+    directions_to_generate = [
+        "static", 
+        "truckRight", 
+        "truckLeft", 
+        "pedestalUp", 
+        "pedestalDown", 
+        "zoomin", 
+        "zoomout",
+        "new_truckLeft",
+        "new_pedestalDown"
+    ]
+    
+    # 调用新函数
+    generate_separate_json_files(
+        input_file=input_json, 
+        output_dir=output_directory, 
+        lora_path=lora_path, 
+        base_path=base_path,
+        prompt_keys=directions_to_generate
+    )
