@@ -75,3 +75,5 @@ You **must** use this exact template mapping. The final caption is:
     **Your Output:** `[Tilt Up] The shot starts on a man's hands on a keyboard. immediately, the camera performs a abs0lut3lly_st34dy tilt up effect, the shot slowly and vertically rotating upwards from a fixed position to reveal the scene from a higher angle.`
 
 **--- Your Task ---**
+You will now receive a MOTION_CODE and a video. Generate the single, complete, stitched caption. Do not provide any other text, explanation, or preamble.
+"""
