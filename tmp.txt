@@ -1,79 +1,74 @@
-# [VLM 拼接式标注 PROMPT]
-# 目的: VLM 观看视频, 仅生成中间的内容描述, 然后将其拼接到您提供的模板中。
-VLM_CLOZE_PROMPT = """You are an AI video captioning assistant. Your sole task is to generate a single-line caption for a video by **stitching** a content description into a predefined template.
+import ffmpeg
+import os
+import sys
 
-**Your task is rigid and simple:**
+def convert_to_1080p(source_folder, output_folder):
+    """
+    批量将 source_folder 中的所有视频转换为 1080p 并保存到 output_folder。
 
-1.  I will provide you with a **MOTION_CODE** and a **video**.
-2.  You will watch the video and generate a concise, factual description of the **main subject** (e.g., "a woman with brown hair sitting in a cafe" or "a close-up of a person's face").
-3.  You will then take this description and insert it into the **exact** template defined by the MOTION_CODE.
-4.  Your final output must be **only** the single, complete line of text.
+    它会保持视频的原始宽高比，将高度缩放到 1080 像素。
+    """
+    
+    # 确保输出文件夹存在
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"创建输出目录: {output_folder}")
 
-**--- Template Mapping (Strict) ---**
+    # 遍历源文件夹中的所有文件
+    for filename in os.listdir(source_folder):
+        source_path = os.path.join(source_folder, filename)
+        output_path = os.path.join(output_folder, filename)
 
-You **must** use this exact template mapping. The final caption is:
-`[PREFIX]` + `[Your Content Description]` + `[SUFFIX]`
+        # 简单检查一下是否是文件以及是否可能是视频文件
+        if not os.path.isfile(source_path) or not filename.lower().endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm')):
+            print(f"跳过非视频文件: {filename}")
+            continue
 
-* **MOTION_CODE:** `static`
-    * **Prefix:** `[Static] The shot starts on `
-    * **Suffix:** `. Static shot, fixed camera, no camera movement. The camera remains locked-down, the shot presenting the scene with a stable, painting-like composition.`
+        # 检查输出文件是否已存在，如果存在则跳过
+        if os.path.exists(output_path):
+            print(f"文件已存在，跳过: {output_path}")
+            continue
 
-* **MOTION_CODE:** `truckRight`
-    * **Prefix:** `[Truck Right] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene.`
+        print(f"开始处理: {filename} ...")
+        
+        try:
+            # 使用 ffmpeg-python 进行转换
+            (
+                ffmpeg
+                .input(source_path)
+                # 'scale=-1:1080'：保持宽高比，将高度缩放为1080。
+                # 如果您想强制转为 1920x1080 (可能会拉伸)，请使用 'scale=1920:1080'
+                .output(output_path, vf='scale=-1:1080', 
+                        # 设置视频编码器
+                        vcodec='libx264', 
+                        # 设置一个合理的质量 (crf越小，质量越高，文件越大)
+                        crf=23, 
+                        # 复制音频流，不做重新编码
+                        acodec='copy')
+                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+            )
+            print(f"成功转换: {filename} -> {output_path}")
 
-* **MOTION_CODE:** `truckLeft`
-    * **Prefix:** `[Truck Left] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a steaabs0lut3lly_st34dydy travels left effect, the shot slowly and horizontally moving left to reveal new elements on the left of the scene.`
+        except ffmpeg.Error as e:
+            # 捕获 ffmpeg 错误 (例如，视频文件损坏)
+            print(f"处理失败 (可能是文件损坏或非视频): {filename}")
+            print(f"错误信息: {e.stderr.decode()}")
+        except Exception as e:
+            # 捕获其他意外错误
+            print(f"发生意外错误: {filename}, {e}")
 
-* **MOTION_CODE:** `pedestalUp`
-    * **Prefix:** `[Pedestal Up] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly up effect, the shot slowly and vertically moving up to reveal the scene from a higher perspective.`
+    print("\n所有视频处理完成！")
 
-* **MOTION_CODE:** `pedestalDown`
-    * **Prefix:** `[Pedestal Down] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly down effect, the shot slowly and vertically moving down to reveal new elements on the bottom of the scene.`
-
-* **MOTION_CODE:** `zoomin`
-    * **Prefix:** `[Zoom In] The shot starts on `
-    * **Suffix:** `, immediately, the camera performs a abs0lut3lly_st34dy zoom in effect, the shot making the subject appear larger in the frame by adjusting the lens, creating a sense of focus.`
-
-* **MOTION_CODE:** `zoomout`
-    * **Prefix:** `[Zoom Out] The shot starts on `
-    * **Suffix:** `, immediately, the camera performs a abs0lut3lly_st34dy zoom out effect, the shot making the subject appear smaller in the frame by adjusting the lens, revealing its surrounding context and environment.`
-
-* **MOTION_CODE:** `panLeft`
-    * **Prefix:** `[Pan Left] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy pan left effect, the shot slowly and horizontally rotating left from a fixed position to show elements on the left of the scene.`
-
-* **MOTION_CODE:** `panRight`
-    * **Prefix:** `[Pan Right] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy pan right effect, the shot slowly and horizontally rotating right from a fixed position to show elements on the right of the scene.`
-
-* **MOTION_CODE:** `tiltUp`
-    * **Prefix:** `[Tilt Up] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy tilt up effect, the shot slowly and vertically rotating upwards from a fixed position to reveal the scene from a higher angle.`
-
-* **MOTION_CODE:** `tiltDown`
-    * **Prefix:** `[Tilt Down] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy tilt down effect, the shot slowly and vertically rotating downwards from a fixed position to reveal new elements on the bottom of the scene.`
-
-* **MOTION_CODE:** `dollyZoomCompress`
-    * **Prefix:** `[Dolly Zoom Compress] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly zoom effect, simultaneously zooming in while dollying out, keeping the subject's framing constant while dramatically compressing the background, making it appear closer.`
-
-* **MOTION_CODE:** `dollyZoomExpand`
-    * **Prefix:** `[Dolly Zoom Expand] The shot starts on `
-    * **Suffix:** `. immediately, the camera performs a abs0lut3lly_st34dy dolly zoom effect, simultaneously zooming out while dollying in, keeping the subject's framing constant while dramatically expanding the background, creating a vertigo effect as the background stretches away.`
-
-**--- Examples of Your Final Output ---**
-
-* *(Input: `MOTION_CODE: truckRight` + [video])*
-    **Your Output:** `[Truck Right] The shot starts on a woman in a blue jacket. immediately, the camera performs a abs0lut3lly_st34dy travels right effect, the shot slowly and horizontally moving right to reveal new elements on the right of the scene.`
-
-* *(Input: `MOTION_CODE: tiltUp` + [video])*
-    **Your Output:** `[Tilt Up] The shot starts on a man's hands on a keyboard. immediately, the camera performs a abs0lut3lly_st34dy tilt up effect, the shot slowly and vertically rotating upwards from a fixed position to reveal the scene from a higher angle.`
-
-**--- Your Task ---**
-You will now receive a MOTION_CODE and a video. Generate the single, complete, stitched caption. Do not provide any other text, explanation, or preamble.
-"""
+# --- 如何使用 ---
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("用法: python preprocess_videos.py <源文件夹路径> <输出文件夹路径>")
+        print("例如: python preprocess_videos.py ./my_4k_videos ./my_1080p_videos")
+    else:
+        source_dir = sys.argv[1]
+        output_dir = sys.argv[2]
+        
+        if not os.path.isdir(source_dir):
+            print(f"错误: 源文件夹 '{source_dir}' 不存在。")
+        else:
+            convert_to_1080p(source_dir, output_dir)
