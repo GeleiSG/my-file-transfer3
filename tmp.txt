@@ -2,11 +2,15 @@ import ffmpeg
 import os
 import sys
 
-def convert_to_1080p(source_folder, output_folder):
+def preprocess_videos_for_model(source_folder, output_folder):
     """
-    批量将 source_folder 中的所有视频转换为 1080p 并保存到 output_folder。
-
-    它会保持视频的原始宽高比，将高度缩放到 1080 像素。
+    批量处理 source_folder 中的视频，为模型训练做准备，并保存到 output_folder。
+    
+    处理步骤 (针对每个视频):
+    1. 缩放: 将视频高度缩放为 1080 像素 (保持宽高比)。
+    2. 帧率: 强制重新采样为 16 fps。
+    3. 帧数: 仅从视频开头截取 81 帧。
+    4. 音频: 移除所有音频轨 (an=None)。
     """
     
     # 确保输出文件夹存在
@@ -17,7 +21,10 @@ def convert_to_1080p(source_folder, output_folder):
     # 遍历源文件夹中的所有文件
     for filename in os.listdir(source_folder):
         source_path = os.path.join(source_folder, filename)
-        output_path = os.path.join(output_folder, filename)
+        # 确保输出文件名一致，即使扩展名可能因编码而异 (这里我们保持 .mp4)
+        base_filename, _ = os.path.splitext(filename)
+        output_path = os.path.join(output_folder, f"{base_filename}.mp4")
+
 
         # 简单检查一下是否是文件以及是否可能是视频文件
         if not os.path.isfile(source_path) or not filename.lower().endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm')):
@@ -36,23 +43,40 @@ def convert_to_1080p(source_folder, output_folder):
             (
                 ffmpeg
                 .input(source_path)
-                # 'scale=-1:1080'：保持宽高比，将高度缩放为1080。
-                # 如果您想强制转为 1920x1080 (可能会拉伸)，请使用 'scale=1920:1080'
-                .output(output_path, vf='scale=-1:1080', 
+                # .output() 中设置所有输出参数
+                .output(output_path, 
+                        
+                        # vf (Video Filter) 过滤器链:
+                        # 'fps=16': 强制视频帧率为 16 fps
+                        # 'scale=-1:1080': 保持宽高比，将高度缩放为 1080
+                        vf='fps=16,scale=-1:1080', 
+                        
+                        # vframes=81: 只输出 81 帧 (从头开始)
+                        # 结合 16fps，视频总时长为 81/16 = 5.0625 秒
+                        vframes=81,
+                        
                         # 设置视频编码器
                         vcodec='libx264', 
+                        
                         # 设置一个合理的质量 (crf越小，质量越高，文件越大)
                         crf=23, 
-                        # 复制音频流，不做重新编码
-                        acodec='copy')
-                .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                        
+                        # 'an=None' (或 an=True) 表示 "Audio None"，即删除音频轨。
+                        # 由于我们截断了视频，'acodec=copy' 会导致音画不同步或错误。
+                        # 对于模型训练，通常不需要音频。
+                        an=None
+                       )
+                # quiet=False 可以让你看到 ffmpeg 的详细输出，有助于调试
+                .run(capture_stdout=True, capture_stderr=True, quiet=True) 
             )
             print(f"成功转换: {filename} -> {output_path}")
 
         except ffmpeg.Error as e:
             # 捕获 ffmpeg 错误 (例如，视频文件损坏)
             print(f"处理失败 (可能是文件损坏或非视频): {filename}")
-            print(f"错误信息: {e.stderr.decode()}")
+            print("--- FFMPEG 错误信息 ---")
+            print(e.stderr.decode())
+            print("------------------------")
         except Exception as e:
             # 捕获其他意外错误
             print(f"发生意外错误: {filename}, {e}")
@@ -63,7 +87,8 @@ def convert_to_1080p(source_folder, output_folder):
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("用法: python preprocess_videos.py <源文件夹路径> <输出文件夹路径>")
-        print("例如: python preprocess_videos.py ./my_4k_videos ./my_1080p_videos")
+        print("功能: 转换视频为 1080p 高度, 16 fps, 且只保留前 81 帧。")
+        print("例如: python preprocess_videos.py ./raw_videos ./processed_videos_81f_16fps")
     else:
         source_dir = sys.argv[1]
         output_dir = sys.argv[2]
@@ -71,4 +96,4 @@ if __name__ == "__main__":
         if not os.path.isdir(source_dir):
             print(f"错误: 源文件夹 '{source_dir}' 不存在。")
         else:
-            convert_to_1080p(source_dir, output_dir)
+            preprocess_videos_for_model(source_dir, output_dir)
