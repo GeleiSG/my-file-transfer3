@@ -1,83 +1,448 @@
 import os
+import sys
+import numpy as np
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from omegaconf import OmegaConf
+# os.environ["CUDA_VISIBLE_DEVICES"] = '7'
 from PIL import Image, ImageOps
+from transformers import AutoTokenizer
+import tempfile
+import json # 补充导入json
 
-def fix_orientation_inplace(target_root_dir):
-    """
-    递归遍历目录，原地修改图片：
-    只处理那些确实有旋转标记(Orientation != 1)的图片。
-    """
-    # 支持的格式
-    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+current_file_path = os.path.abspath(__file__)
+project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dirname(current_file_path)), os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))]
+for project_root in project_roots:
+    sys.path.insert(0, project_root) if project_root not in sys.path else None
+
+from videox_fun.dist import set_multi_gpus_devices, shard_model
+from videox_fun.models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
+                               WanT5EncoderModel, WanTransformer3DModel)
+from videox_fun.models.cache_utils import get_teacache_coefficients
+from videox_fun.pipeline import WanI2VPipeline
+from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, replace_parameters_by_name,
+                                              convert_weight_dtype_wrapper)
+from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
+from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
+                                   save_videos_grid)
+from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
+from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+import argparse
+
+import time
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Video generation configuration")
+
+    parser.add_argument("--json_path", type=str, 
+                        default="inference_cases.json",
+                        help="Path to JSON file containing inference cases")
     
-    # EXIF 中 Orientation 标签的 ID 是 274
-    exif_orientation_tag = 274
+    parser.add_argument(
+        "--gpu", 
+        type=str, 
+        default="1",  # 默认使用GPU 0
+        help="指定要使用的GPU ID。例如: '0', '0,1', '2,3'"
+    )
     
-    modified_count = 0
-    skipped_count = 0
-    error_count = 0
+    parser.add_argument("--seed", type=int, default=43,
+                        help="Random seed for reproducibility")
+    
+    parser.add_argument("--save_path", type=str, default="samples/image_tests_black_new_720p_pose2_autoregressive",
+                        help="Path to save generated outputs")
+    
+    parser.add_argument("--not_use_lora", action="store_true")
+    
+    parser.add_argument("--sample_size", default="[720, 1280]")
 
-    print(f"开始扫描并修正: {target_root_dir} ...")
+    parser.add_argument("--lora_weight", type=float, default=1.0)
 
-    for root, dirs, files in os.walk(target_root_dir):
-        for filename in files:
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in valid_extensions:
-                continue
+    parser.add_argument("--different_lora", type=bool, default=False)
 
-            file_path = os.path.join(root, filename)
+    return parser.parse_args()
 
-            try:
-                needs_save = False
-                fixed_image = None
+def load_inference_cases(json_path):
+    with open(json_path, 'r') as f:
+        cases = json.load(f)
+    return cases
 
-                # 第一步：以只读方式打开，检查是否需要旋转
-                # 使用 with 语句确保读取完后立即关闭文件句柄，防止写入时冲突
-                with Image.open(file_path) as img:
-                    
-                    # 获取 EXIF 数据
-                    exif_data = img.getexif()
-                    
-                    # 获取方向值，如果没有该标签，默认为 1 (正常)
-                    orientation = exif_data.get(exif_orientation_tag, 1)
-                    
-                    # 如果方向不是 1 (1 代表 Normal，即不需要旋转)，才进行处理
-                    if orientation > 1:
-                        # exif_transpose 会返回一个新的图片对象，且已移除方向 tag
-                        # 注意：这里只是在内存中处理，还没存盘
-                        fixed_image = ImageOps.exif_transpose(img)
-                        needs_save = True
-                
-                # 第二步：如果需要保存，则覆盖原文件
-                # 此时上面的 'with' 块已结束，文件句柄已释放，可以安全写入
-                if needs_save and fixed_image:
-                    # 如果是 RGBA (透明PNG) 转 JPG 可能会报错，这里做个保险
-                    if fixed_image.mode in ("RGBA", "P") and ext in ['.jpg', '.jpeg']:
-                        fixed_image = fixed_image.convert("RGB")
-                    
-                    # 覆盖原文件
-                    # quality=95 尽量保持高画质，subsampling=0 防止色彩采样损失
-                    fixed_image.save(file_path, quality=95, subsampling=0)
-                    
-                    print(f"[已修正] {filename}")
-                    modified_count += 1
-                else:
-                    # print(f"[跳过] {filename} (无需旋转)")
-                    skipped_count += 1
+def initialize_pipeline(args):
+    negative_prompt = "bright colors, overexposed, static, blurred details, subtitles, style, artwork, painting, picture, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still picture, cluttered background, three legs, many people in the background, walking backwards"
+    guidance_scale = 5.0 # 通常Wan需要稍高一点的引导，或者保持你原本的设置
+    num_inference_steps = 50 # 根据模型具体情况调整，Wan2.1通常需要较多步数，如果是Turbo模型可用4步
+    # 注意：上面代码中你原来写的是 guidance_scale=0.0 和 steps=4，如果是Turbo/Lightning模型请保持原样。
+    # 这里我还原为你代码中的设置，请根据实际模型确认：
+    guidance_scale = 5.0 
+    num_inference_steps = 4
+    
+    lora_weight = args.lora_weight
 
-            except Exception as e:
-                print(f"[错误] 无法处理 {file_path}: {e}")
-                error_count += 1
+    GPU_memory_mode       = "model_cpu_offload"
+    ulysses_degree        = 1
+    ring_degree           = 1
+    fsdp_dit              = False
+    fsdp_text_encoder     = True
+    compile_dit           = False
+    enable_teacache       = False
+    teacache_threshold    = 0.10
+    num_skip_start_steps  = 5
+    teacache_offload      = False
+    cfg_skip_ratio        = 0
+    enable_riflex         = False
+    riflex_k              = 6
+    config_path           = "config/wan2.1/wan_civitai.yaml"
+    model_name            = "/mnt/data/ssd/user_data/qiaoyu/LTV/Wan2.1-I2V-14B-480P-4steps/"
+    sampler_name          = "Flow_Unipc"
+    shift                 = 5.0 
+    transformer_path      = None
+    vae_path              = None
+    sample_size           = [int(x) for x in args.sample_size.strip("[]").split(",")]
+    # 这里虽然写了81，但实际生成时我们会用49覆盖它
+    video_length          = 81 
+    fps                   = 16
+    weight_dtype          = torch.bfloat16
 
-    print("-" * 30)
-    print(f"处理完成！")
-    print(f"  - 修改并覆盖: {modified_count} 张")
-    print(f"  - 无需修改: {skipped_count} 张")
-    print(f"  - 出错: {error_count} 张")
+    device = set_multi_gpus_devices(ulysses_degree, ring_degree)
+    config = OmegaConf.load(config_path)
 
-# --- 配置路径 ---
-# 请替换为你的实际根目录路径
-target_dir = "./my_dataset_images"
+    # Initialize models
+    transformer = WanTransformer3DModel.from_pretrained(
+        os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
+        transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    )
 
-if __name__ == '__main__':
-    # 再次提醒：请确保已有备份
-    fix_orientation_inplace(target_dir)
+    if transformer_path is not None:
+        print(f"From checkpoint: {transformer_path}")
+        if transformer_path.endswith("safetensors"):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(transformer_path)
+        else:
+            state_dict = torch.load(transformer_path, map_location="cpu")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+        m, u = transformer.load_state_dict(state_dict, strict=False)
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+
+    vae = AutoencoderKLWan.from_pretrained(
+        os.path.join(model_name, config['vae_kwargs'].get('vae_subpath', 'vae')),
+        additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
+    ).to(weight_dtype)
+
+    if vae_path is not None:
+        print(f"From checkpoint: {vae_path}")
+        if vae_path.endswith("safetensors"):
+            from safetensors.torch import load_file, safe_open
+            state_dict = load_file(vae_path)
+        else:
+            state_dict = torch.load(vae_path, map_location="cpu")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+        m, u = vae.load_state_dict(state_dict, strict=False)
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(model_name, config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
+    )
+
+    text_encoder = WanT5EncoderModel.from_pretrained(
+        os.path.join(model_name, config['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
+        additional_kwargs=OmegaConf.to_container(config['text_encoder_kwargs']),
+        low_cpu_mem_usage=True,
+        torch_dtype=weight_dtype,
+    )
+    text_encoder = text_encoder.eval()
+
+    clip_image_encoder = CLIPModel.from_pretrained(
+        os.path.join(model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    ).to(weight_dtype)
+    clip_image_encoder = clip_image_encoder.eval()
+
+    Choosen_Scheduler = {
+        "Flow": FlowMatchEulerDiscreteScheduler,
+        "Flow_Unipc": FlowUniPCMultistepScheduler,
+        "Flow_DPM++": FlowDPMSolverMultistepScheduler,
+    }[sampler_name]
+    
+    if sampler_name == "Flow_Unipc" or sampler_name == "Flow_DPM++":
+        config['scheduler_kwargs']['shift'] = 1
+    scheduler = Choosen_Scheduler(
+        **filter_kwargs(Choosen_Scheduler, OmegaConf.to_container(config['scheduler_kwargs']))
+    )
+
+    pipeline = WanI2VPipeline(
+        transformer=transformer,
+        vae=vae,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        scheduler=scheduler,
+        clip_image_encoder=clip_image_encoder
+    )
+    
+    if ulysses_degree > 1 or ring_degree > 1:
+        from functools import partial
+        transformer.enable_multi_gpus_inference()
+        if fsdp_dit:
+            shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+            pipeline.transformer = shard_fn(pipeline.transformer)
+            print("Add FSDP DIT")
+        if fsdp_text_encoder:
+            shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
+            pipeline.text_encoder = shard_fn(pipeline.text_encoder)
+            print("Add FSDP TEXT ENCODER")
+
+    if compile_dit:
+        for i in range(len(pipeline.transformer.blocks)):
+            pipeline.transformer.blocks[i] = torch.compile(pipeline.transformer.blocks[i])
+        print("Add Compile")
+
+    if GPU_memory_mode == "sequential_cpu_offload":
+        replace_parameters_by_name(transformer, ["modulation",], device=device)
+        transformer.freqs = transformer.freqs.to(device=device)
+        pipeline.enable_sequential_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_cpu_offload_and_qfloat8":
+        convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+        convert_weight_dtype_wrapper(transformer, weight_dtype)
+        pipeline.enable_model_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_cpu_offload":
+        pipeline.enable_model_cpu_offload(device=device)
+    elif GPU_memory_mode == "model_full_load_and_qfloat8":
+        convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",], device=device)
+        convert_weight_dtype_wrapper(transformer, weight_dtype)
+        pipeline.to(device=device)
+    else:
+        pipeline.to(device=device)
+
+    coefficients = get_teacache_coefficients(model_name) if enable_teacache else None
+    if coefficients is not None:
+        print(f"Enable TeaCache with threshold {teacache_threshold} and skip the first {num_skip_start_steps} steps.")
+        pipeline.transformer.enable_teacache(
+            coefficients, num_inference_steps, teacache_threshold, num_skip_start_steps=num_skip_start_steps, offload=teacache_offload
+        )
+
+    if cfg_skip_ratio is not None:
+        print(f"Enable cfg_skip_ratio {cfg_skip_ratio}.")
+        pipeline.transformer.enable_cfg_skip(cfg_skip_ratio, num_inference_steps)
+
+    return pipeline, device, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight
+
+
+def prepare_input_image(image_path, sample_size):
+    """
+    辅助函数：准备输入图像，处理缩放和黑边
+    返回：临时文件路径
+    """
+    try:
+        target_height = sample_size[0]
+        target_width = sample_size[1]
+        target_size_pil = (target_width, target_height) 
+
+        with Image.open(image_path) as image:
+            image = image.convert('RGB')
+            img_copy = image.copy()
+            img_copy.thumbnail(target_size_pil, Image.Resampling.LANCZOS)
+            
+            background = Image.new('RGB', target_size_pil, (0, 0, 0))
+            paste_x = (target_width - img_copy.width) // 2
+            paste_y = (target_height - img_copy.height) // 2
+            background.paste(img_copy, (paste_x, paste_y))
+            
+            temp_f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            background.save(temp_f.name)
+            return temp_f.name
+    except Exception as e:
+        print(f"警告: 图像预处理失败 {image_path}。错误: {e}")
+        return image_path
+
+def process_case(pipeline, device, case, video_length_ignored, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight, save_path, seed, not_use_lora, different_lora):
+    # 强制设置单次生成帧数为 49
+    SINGLE_PASS_FRAMES = 49
+    
+    # 用于存储生成的视频片段（tensor）
+    video_segments = []
+    
+    # 临时文件列表，用于最后清理
+    temp_files_to_clean = []
+    
+    current_seed = seed
+    current_input_image_path = case['start_image']
+    
+    # 我们需要执行两次生成
+    # 第一次：使用原始图片 -> 生成49帧
+    # 第二次：使用第一次的第49帧 -> 生成49帧
+    
+    try:
+        # ------------------ 如果需要更换 LoRA ------------------
+        if different_lora:
+            if case.get('lora_path') and not not_use_lora:
+                pipeline = merge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+
+        # ================== 第一段生成 (Frames 0-48) ==================
+        print("Generating Segment 1/2...")
+        generator = torch.Generator(device=device).manual_seed(current_seed)
+        
+        # 准备第一张图
+        input_img_path_1 = prepare_input_image(current_input_image_path, sample_size)
+        if input_img_path_1 != current_input_image_path:
+            temp_files_to_clean.append(input_img_path_1)
+
+        with torch.no_grad():
+            # 计算 Latent
+            input_video, input_video_mask, clip_image = get_image_to_video_latent(
+                input_img_path_1, None, video_length=SINGLE_PASS_FRAMES, 
+                sample_size=sample_size
+            )
+
+            # 推理
+            sample1 = pipeline(
+                case['prompt'], 
+                num_frames=SINGLE_PASS_FRAMES,
+                negative_prompt=negative_prompt,
+                height=sample_size[0],
+                width=sample_size[1],
+                generator=generator,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                video=input_video,
+                mask_video=input_video_mask,
+                clip_image=clip_image,
+                shift=shift,
+            ).videos # [1, 3, 49, H, W]
+            
+            video_segments.append(sample1)
+
+        # ================== 提取中间帧 ==================
+        # 提取 sample1 的最后一帧 (index -1)
+        # sample1 shape: [Batch, Channels, Frames, Height, Width]
+        last_frame_tensor = sample1[0, :, -1, :, :] # [3, H, W]
+        
+        # 转换为 PIL Image
+        # 假设输出范围是 [0, 1]，如果是 [-1, 1] 需要 (x+1)/2
+        # Wan 通常输出是 0-1 范围的 tensor
+        last_frame_np = (last_frame_tensor.permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+        last_frame_img = Image.fromarray(last_frame_np)
+        
+        # 保存为临时文件
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_mid:
+            last_frame_img.save(temp_mid.name)
+            input_img_path_2 = temp_mid.name
+            temp_files_to_clean.append(input_img_path_2)
+            print(f"Intermediate frame saved to {input_img_path_2}")
+
+        # ================== 第二段生成 (Frames 48-96) ==================
+        print("Generating Segment 2/2...")
+        # 为了保持连贯性，我们可以沿用同一个 seed，或者 seed + 1，取决于想要的效果
+        # 通常 autoregressive 使用相同的 seed 可以保持噪声模式的一致性
+        generator = torch.Generator(device=device).manual_seed(current_seed) 
+        
+        # 准备第二张图 (已经是正确尺寸了，但为了保险还是走一遍 prepare)
+        # 注意：这里的 input_img_path_2 已经是我们生成的中间帧
+        
+        with torch.no_grad():
+            input_video_2, input_video_mask_2, clip_image_2 = get_image_to_video_latent(
+                input_img_path_2, None, video_length=SINGLE_PASS_FRAMES, 
+                sample_size=sample_size
+            )
+
+            sample2 = pipeline(
+                case['prompt'], 
+                num_frames=SINGLE_PASS_FRAMES,
+                negative_prompt=negative_prompt,
+                height=sample_size[0],
+                width=sample_size[1],
+                generator=generator,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                video=input_video_2,
+                mask_video=input_video_mask_2,
+                clip_image=clip_image_2,
+                shift=shift,
+            ).videos # [1, 3, 49, H, W]
+            
+            # 注意：第二段的第0帧其实就是第一段的第48帧（视觉上几乎一样）
+            # 为了流畅拼接，我们通常丢弃第二段的第0帧
+            video_segments.append(sample2[:, :, 1:, :, :]) 
+
+        # ------------------ 如果需要 Unmerge LoRA ------------------
+        if different_lora:
+            if case.get('lora_path'):
+                pipeline = unmerge_lora(pipeline, case['lora_path'], lora_weight, device=device)
+        
+        # ================== 拼接结果 ==================
+        # Segment 1: 49 frames
+        # Segment 2: 48 frames (49 - 1)
+        # Total: 97 frames
+        final_sample = torch.cat(video_segments, dim=2)
+        
+        return final_sample
+
+    finally:
+        # 清理所有临时文件
+        for tmp_path in temp_files_to_clean:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception as e:
+                    pass
+
+def save_results(sample, save_path, case_idx, video_length, fps):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path, exist_ok=True)
+
+    prefix = str(case_idx).zfill(4)
+    # 获取实际生成的帧数
+    actual_video_length = sample.shape[2]
+    
+    if actual_video_length == 1:
+        video_path = os.path.join(save_path, f"{prefix}.png")
+        image = sample[0, :, 0]
+        image = image.transpose(0, 1).transpose(1, 2)
+        image = (image * 255).numpy().astype(np.uint8)
+        image = Image.fromarray(image)
+        image.save(video_path)
+    else:
+        video_path = os.path.join(save_path, f"{prefix}.mp4")
+        save_videos_grid(sample, video_path, fps=fps)
+    
+    return video_path
+
+def main():
+    args = parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    cases = load_inference_cases(args.json_path)
+    
+    # Initialize pipeline once
+    pipeline, device, video_length, sample_size, fps, shift, negative_prompt, guidance_scale, num_inference_steps, lora_weight = initialize_pipeline(args)
+
+    if not args.different_lora and not args.not_use_lora:
+        # 检查 cases[0] 是否有 lora_path，如果没有可能需要处理
+        if 'lora_path' in cases[0]:
+            pipeline = merge_lora(pipeline, cases[0]['lora_path'], lora_weight, device=device)
+            print("info: lora merged!")
+        else:
+            print("warning: global lora enabled but no lora_path found in first case.")
+    
+    # Process each case
+    for idx, case in enumerate(cases):
+        print(f"Processing case {idx + 1}/{len(cases)}: {case['prompt'][:50]}...")
+        
+        try:
+            t1 = time.time()
+            sample = process_case(
+                pipeline, device, case, video_length, sample_size, fps, shift, 
+                negative_prompt, guidance_scale, num_inference_steps, lora_weight, 
+                args.save_path, args.seed + idx, args.not_use_lora, args.different_lora
+            )
+            
+            # 注意：这里的 video_length 仅用于命名或逻辑判断，实际保存依据 sample 的 shape
+            output_path = save_results(sample, args.save_path, idx + 1, sample.shape[2], fps)
+            print(f"Saved output for case {idx + 1} to: {output_path}")
+            print("inference_consume",time.time()-t1)
+            
+        except Exception as e:
+            print(f"Error processing case {idx + 1}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+if __name__ == "__main__":
+    main()
