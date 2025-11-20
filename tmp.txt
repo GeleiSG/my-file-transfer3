@@ -1,38 +1,83 @@
-from PIL import Image, ImageOps
 import os
+from PIL import Image, ImageOps
 
-def fix_image_orientation(input_folder, output_folder):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+def fix_orientation_inplace(target_root_dir):
+    """
+    递归遍历目录，原地修改图片：
+    只处理那些确实有旋转标记(Orientation != 1)的图片。
+    """
+    # 支持的格式
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+    
+    # EXIF 中 Orientation 标签的 ID 是 274
+    exif_orientation_tag = 274
+    
+    modified_count = 0
+    skipped_count = 0
+    error_count = 0
 
-    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    print(f"开始扫描并修正: {target_root_dir} ...")
 
-    for filename in os.listdir(input_folder):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in valid_extensions:
-            continue
+    for root, dirs, files in os.walk(target_root_dir):
+        for filename in files:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in valid_extensions:
+                continue
 
-        input_path = os.path.join(input_folder, filename)
-        output_path = os.path.join(output_folder, filename)
+            file_path = os.path.join(root, filename)
 
-        try:
-            image = Image.open(input_path)
-            
-            # 核心步骤：根据 EXIF 信息自动旋转图片并移除 EXIF 标签
-            # 如果图片没有 EXIF 或不需要旋转，它会保持原样
-            fixed_image = ImageOps.exif_transpose(image)
-            
-            # 保存处理后的图片
-            # quality=95 保证 JPG 质量，根据需要调整
-            fixed_image.save(output_path, quality=95)
-            print(f"Processed: {filename}")
-            
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
+            try:
+                needs_save = False
+                fixed_image = None
 
-# 使用示例
-# 替换为你的实际路径
-input_dir = "./raw_images"
-output_dir = "./fixed_images"
+                # 第一步：以只读方式打开，检查是否需要旋转
+                # 使用 with 语句确保读取完后立即关闭文件句柄，防止写入时冲突
+                with Image.open(file_path) as img:
+                    
+                    # 获取 EXIF 数据
+                    exif_data = img.getexif()
+                    
+                    # 获取方向值，如果没有该标签，默认为 1 (正常)
+                    orientation = exif_data.get(exif_orientation_tag, 1)
+                    
+                    # 如果方向不是 1 (1 代表 Normal，即不需要旋转)，才进行处理
+                    if orientation > 1:
+                        # exif_transpose 会返回一个新的图片对象，且已移除方向 tag
+                        # 注意：这里只是在内存中处理，还没存盘
+                        fixed_image = ImageOps.exif_transpose(img)
+                        needs_save = True
+                
+                # 第二步：如果需要保存，则覆盖原文件
+                # 此时上面的 'with' 块已结束，文件句柄已释放，可以安全写入
+                if needs_save and fixed_image:
+                    # 如果是 RGBA (透明PNG) 转 JPG 可能会报错，这里做个保险
+                    if fixed_image.mode in ("RGBA", "P") and ext in ['.jpg', '.jpeg']:
+                        fixed_image = fixed_image.convert("RGB")
+                    
+                    # 覆盖原文件
+                    # quality=95 尽量保持高画质，subsampling=0 防止色彩采样损失
+                    fixed_image.save(file_path, quality=95, subsampling=0)
+                    
+                    print(f"[已修正] {filename}")
+                    modified_count += 1
+                else:
+                    # print(f"[跳过] {filename} (无需旋转)")
+                    skipped_count += 1
 
-fix_image_orientation(input_dir, output_dir)
+            except Exception as e:
+                print(f"[错误] 无法处理 {file_path}: {e}")
+                error_count += 1
+
+    print("-" * 30)
+    print(f"处理完成！")
+    print(f"  - 修改并覆盖: {modified_count} 张")
+    print(f"  - 无需修改: {skipped_count} 张")
+    print(f"  - 出错: {error_count} 张")
+
+# --- 配置路径 ---
+# 请替换为你的实际根目录路径
+target_dir = "./my_dataset_images"
+
+if __name__ == '__main__':
+    # 再次提醒：请确保已有备份
+    fix_orientation_inplace(target_dir)
