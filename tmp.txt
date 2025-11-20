@@ -1,99 +1,38 @@
-import ffmpeg
+from PIL import Image, ImageOps
 import os
-import sys
 
-def preprocess_videos_for_model(source_folder, output_folder):
-    """
-    批量处理 source_folder 中的视频，为模型训练做准备，并保存到 output_folder。
-    
-    处理步骤 (针对每个视频):
-    1. 缩放: 将视频高度缩放为 1080 像素 (保持宽高比)。
-    2. 帧率: 强制重新采样为 16 fps。
-    3. 帧数: 仅从视频开头截取 81 帧。
-    4. 音频: 移除所有音频轨 (an=None)。
-    """
-    
-    # 确保输出文件夹存在
+def fix_image_orientation(input_folder, output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
-        print(f"创建输出目录: {output_folder}")
 
-    # 遍历源文件夹中的所有文件
-    for filename in os.listdir(source_folder):
-        source_path = os.path.join(source_folder, filename)
-        # 确保输出文件名一致，即使扩展名可能因编码而异 (这里我们保持 .mp4)
-        base_filename, _ = os.path.splitext(filename)
-        output_path = os.path.join(output_folder, f"{base_filename}.mp4")
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
-
-        # 简单检查一下是否是文件以及是否可能是视频文件
-        if not os.path.isfile(source_path) or not filename.lower().endswith(('.mp4', '.mkv', '.mov', '.avi', '.webm')):
-            print(f"跳过非视频文件: {filename}")
+    for filename in os.listdir(input_folder):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in valid_extensions:
             continue
 
-        # 检查输出文件是否已存在，如果存在则跳过
-        if os.path.exists(output_path):
-            print(f"文件已存在，跳过: {output_path}")
-            continue
+        input_path = os.path.join(input_folder, filename)
+        output_path = os.path.join(output_folder, filename)
 
-        print(f"开始处理: {filename} ...")
-        
         try:
-            # 使用 ffmpeg-python 进行转换
-            (
-                ffmpeg
-                .input(source_path)
-                # .output() 中设置所有输出参数
-                .output(output_path, 
-                        
-                        # vf (Video Filter) 过滤器链:
-                        # 'fps=16': 强制视频帧率为 16 fps
-                        # 'scale=-1:1080': 保持宽高比，将高度缩放为 1080
-                        vf='fps=16,scale=-1:1080', 
-                        
-                        # vframes=81: 只输出 81 帧 (从头开始)
-                        # 结合 16fps，视频总时长为 81/16 = 5.0625 秒
-                        vframes=81,
-                        
-                        # 设置视频编码器
-                        vcodec='libx264', 
-                        
-                        # 设置一个合理的质量 (crf越小，质量越高，文件越大)
-                        crf=23, 
-                        
-                        # 'an=None' (或 an=True) 表示 "Audio None"，即删除音频轨。
-                        # 由于我们截断了视频，'acodec=copy' 会导致音画不同步或错误。
-                        # 对于模型训练，通常不需要音频。
-                        an=None
-                       )
-                # quiet=False 可以让你看到 ffmpeg 的详细输出，有助于调试
-                .run(capture_stdout=True, capture_stderr=True, quiet=True) 
-            )
-            print(f"成功转换: {filename} -> {output_path}")
-
-        except ffmpeg.Error as e:
-            # 捕获 ffmpeg 错误 (例如，视频文件损坏)
-            print(f"处理失败 (可能是文件损坏或非视频): {filename}")
-            print("--- FFMPEG 错误信息 ---")
-            print(e.stderr.decode())
-            print("------------------------")
+            image = Image.open(input_path)
+            
+            # 核心步骤：根据 EXIF 信息自动旋转图片并移除 EXIF 标签
+            # 如果图片没有 EXIF 或不需要旋转，它会保持原样
+            fixed_image = ImageOps.exif_transpose(image)
+            
+            # 保存处理后的图片
+            # quality=95 保证 JPG 质量，根据需要调整
+            fixed_image.save(output_path, quality=95)
+            print(f"Processed: {filename}")
+            
         except Exception as e:
-            # 捕获其他意外错误
-            print(f"发生意外错误: {filename}, {e}")
+            print(f"Error processing {filename}: {e}")
 
-    print("\n所有视频处理完成！")
+# 使用示例
+# 替换为你的实际路径
+input_dir = "./raw_images"
+output_dir = "./fixed_images"
 
-# --- 如何使用 ---
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("用法: python preprocess_videos.py <源文件夹路径> <输出文件夹路径>")
-        print("功能: 转换视频为 1080p 高度, 16 fps, 且只保留前 81 帧。")
-        print("例如: python preprocess_videos.py ./raw_videos ./processed_videos_81f_16fps")
-    else:
-        source_dir = sys.argv[1]
-        output_dir = sys.argv[2]
-        
-        if not os.path.isdir(source_dir):
-            print(f"错误: 源文件夹 '{source_dir}' 不存在。")
-        else:
-            preprocess_videos_for_model(source_dir, output_dir)
+fix_image_orientation(input_dir, output_dir)
