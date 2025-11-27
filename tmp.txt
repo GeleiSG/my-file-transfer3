@@ -1,76 +1,72 @@
-pip install diffusers transformers accelerate torch invisible-watermark
-
 import os
 import torch
 from PIL import Image
-from diffusers import AutoPipelineForImage2Image
+from diffusers import FluxKontextPipeline
 from diffusers.utils import load_image
 
 # --- 配置区域 ---
-# 输入和输出路径
 INPUT_DIR = "./input_frames"
-OUTPUT_DIR = "./output_cleaned"
+OUTPUT_DIR = "./output_kontext"
+MODEL_ID = "black-forest-labs/FLUX.1-Kontext-dev"
 
-# 模型选择：推荐 RealVisXL V4.0 (对人像皮肤质感还原极佳)
-# 首次运行会自动下载约 6-7GB 的模型
-MODEL_ID = "SG161222/RealVisXL_V4.0" 
+# 核心指令：这不再是描述画面，而是“下命令”
+# 针对您的伪纹理场景，我们尝试以下几种指令风格
+EDIT_INSTRUCTION = "Denoise the image, remove digital artifacts, and improve skin texture quality."
 
-# 关键参数调优
-# Strength (重绘幅度): 核心参数
-# 针对视频伪影，建议在 0.15 到 0.3 之间
-# 0.15: 非常保守，只去噪，不改五官
-# 0.30: 修复能力强，但可能微调眼神或表情
-STRENGTH = 0.25 
+# Guidance Scale (引导系数)
+# 官方示例用了 2.5。
+# 对于去噪任务，建议在 2.0 - 3.5 之间尝试。
+# 太低：指令不生效（噪点去不掉）。
+# 太高：可能过度平滑或改变非目标区域。
+GUIDANCE_SCALE = 2.5 
 
-# 提示词：越通用越好，强调真实感
-PROMPT = "photorealistic, 8k, ultra detailed, raw photo, realistic skin texture, dslr, soft lighting"
-NEGATIVE_PROMPT = "noise, film grain, compression artifacts, pixelated, blurry, low quality, plastic skin, cgi, 3d render"
-
-# --- 初始化管道 ---
-print(f"正在加载模型: {MODEL_ID} ...")
-pipe = AutoPipelineForImage2Image.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    variant="fp16",
-    use_safetensors=True
+# --- 初始化 ---
+print(f"正在加载 FLUX.1 Kontext [dev] ...")
+# 注意：Kontext 需要从 git 安装的 diffusers 加载
+pipe = FluxKontextPipeline.from_pretrained(
+    MODEL_ID, 
+    torch_dtype=torch.bfloat16
 )
 
-# 显存优化策略 (根据显卡情况选择)
-# 如果是 24G 显存 (3090/4090)，可以直接 pipe.to("cuda")
-# 如果是 12G-16G 显存，建议用 enable_model_cpu_offload()
-pipe.enable_model_cpu_offload() 
-# pipe.to("cuda") 
+# 显存优化
+pipe.enable_model_cpu_offload()
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- 批量处理函数 ---
 def process_images():
-    valid_exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+    valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
     files = [f for f in os.listdir(INPUT_DIR) if os.path.splitext(f)[1].lower() in valid_exts]
     
-    print(f"发现 {len(files)} 张图片，开始处理...")
+    print(f"开始处理 {len(files)} 张图片")
+    print(f"指令: {EDIT_INSTRUCTION}")
+    print(f"Guidance Scale: {GUIDANCE_SCALE}")
     
     for filename in files:
         img_path = os.path.join(INPUT_DIR, filename)
         save_path = os.path.join(OUTPUT_DIR, filename)
         
         try:
-            # 加载图片并确保是 RGB
-            init_image = Image.open(img_path).convert("RGB")
+            # 1. 加载图片
+            input_image = load_image(img_path)
             
-            # 如果图片不是 1024x1024 附近的，SDXL 也能处理，但最好不要太小
-            # 这里不做强制 resize，保留原分辨率 (SDXL 支持多分辨率桶)
+            # FLUX 仍然建议输入尺寸为 16 的倍数
+            w, h = input_image.size
+            new_w = w - (w % 16)
+            new_h = h - (h % 16)
+            if new_w != w or new_h != h:
+                input_image = input_image.resize((new_w, new_h), Image.LANCZOS)
             
+            # 2. 执行编辑
+            # num_inference_steps 默认为 28-30 左右即可
             result = pipe(
-                prompt=PROMPT,
-                negative_prompt=NEGATIVE_PROMPT,
-                image=init_image,
-                strength=STRENGTH,
-                guidance_scale=6.0, # 略微降低 CFG 可以让画面更柔和
-                num_inference_steps=30, # 步数给足，保证质感细腻
-                target_size=(1024, 1024) # 只是作为参考，SDXL会自动适配
+                image=input_image,
+                prompt=EDIT_INSTRUCTION,
+                guidance_scale=GUIDANCE_SCALE,
+                num_inference_steps=28,
+                generator=torch.Generator("cpu").manual_seed(42)
             ).images[0]
             
+            # 3. 保存
             result.save(save_path, quality=95)
             print(f"[完成] {filename}")
             
