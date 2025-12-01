@@ -1,87 +1,50 @@
-import subprocess
+from PIL import Image
 import os
-import glob
-from pathlib import Path
 
-# ================= 配置区域 =================
-INPUT_FOLDER = r'./videos'        # 输入文件夹
-OUTPUT_FOLDER = r'./output_frames' # 输出文件夹
-
-# 逻辑参数
-TARGET_FPS = 16
-TARGET_FRAME_NUM = 25
-
-# 支持的扩展名
-VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
-# ===========================================
-
-def get_timestamp(target_frame, target_fps):
+def resize_image_half_pil(input_path, output_path):
     """
-    计算时间戳 (秒)
-    公式: (帧号 - 1) / FPS
+    使用 Pillow 库将图片调整为原来的一半大小。
     """
-    return (target_frame - 1) / target_fps
-
-def extract_frame_ffmpeg(video_path, output_dir):
-    # 1. 计算时间点
-    timestamp = get_timestamp(TARGET_FRAME_NUM, TARGET_FPS)
-    
-    # 2. 准备输出路径
-    video_name = Path(video_path).stem
-    output_filename = f"{video_name}_fps{TARGET_FPS}_frame{TARGET_FRAME_NUM}.jpg"
-    output_path = os.path.join(output_dir, output_filename)
-    
-    # 3. 构建 FFmpeg 命令
-    # -y: 覆盖同名文件
-    # -ss: 跳转到指定时间 (放在 -i 之前为快速定位，放在 -i 之后为精确解码定位)
-    #      这里我们放在 -i 之前以获得最快速度，现代 FFmpeg 在此模式下对单帧提取也很准。
-    # -i: 输入文件
-    # -frames:v 1: 只输出 1 帧
-    # -q:v 2: 输出高质量 JPG (范围 1-31, 2 为极高画质)
-    # -loglevel error: 减少控制台输出，只显示错误
-    
-    cmd = [
-        'ffmpeg',
-        '-y',
-        '-ss', str(timestamp), 
-        '-i', video_path,
-        '-frames:v', '1',
-        '-q:v', '2', 
-        '-loglevel', 'error', 
-        output_path
-    ]
-    
     try:
-        # 执行命令
-        subprocess.run(cmd, check=True)
-        print(f"[成功] {output_filename} (时间: {timestamp}s)")
-    except subprocess.CalledProcessError:
-        print(f"[失败] 无法处理: {video_path}")
+        # 1. 打开图片
+        # 使用 with 语句可以确保图片在使用后正确关闭
+        with Image.open(input_path) as img:
+            # 获取原始尺寸 (注意 PIL 的 size 是 (width, height))
+            original_width, original_height = img.size
+            print(f"原始尺寸: {original_width}x{original_height}")
+
+            # 2. 计算新的尺寸 (必须是整数)
+            # 使用 // 进行整除，或者用 int() 转换
+            new_width = int(original_width * 0.5)
+            new_height = int(original_height * 0.5)
+            print(f"目标尺寸: {new_width}x{new_height}")
+
+            # 3. 调整大小
+            # 使用 LANCZOS 滤镜以获得高质量的下采样结果
+            resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # 4. 保存图片
+            # Pillow 会根据文件扩展名自动判断保存格式 (如 .jpg, .png)
+            resized_img.save(output_path, quality=95) # quality仅对JPG有效，可选
+            print(f"成功保存调整后的图片至: {output_path}")
+
     except FileNotFoundError:
-        print("[错误] 未找到 ffmpeg，请检查环境变量或安装 ffmpeg。")
-        exit()
+        print(f"错误: 找不到文件 {input_path}")
+    except Exception as e:
+        print(f"发生错误: {e}")
 
-def main():
-    if not os.path.exists(OUTPUT_FOLDER):
-        os.makedirs(OUTPUT_FOLDER)
+# --- 使用示例 ---
 
-    video_files = []
-    for ext in VIDEO_EXTENSIONS:
-        video_files.extend(glob.glob(os.path.join(INPUT_FOLDER, ext)))
-    
-    if not video_files:
-        print(f"在 {INPUT_FOLDER} 未找到视频。")
-        return
+# 假设你当前目录下有一张名为 "example.jpg" 的图片
+input_image_file = "example.jpg"
+# 指定输出文件名
+output_image_file = "example_half_pil.jpg"
 
-    print(f"开始处理 {len(video_files)} 个视频...")
-    print(f"定位时间点: {get_timestamp(TARGET_FRAME_NUM, TARGET_FPS)} 秒")
-    print("-" * 30)
+# 为了测试，我们需要先创建一个假图片（如果你本地有图片，可以跳过这一步，直接修改上面的文件名）
+if not os.path.exists(input_image_file):
+    print(f"正在创建测试图片 {input_image_file}...")
+    test_img = Image.new('RGB', (800, 600), color='red')
+    test_img.save(input_image_file)
 
-    for video in video_files:
-        extract_frame_ffmpeg(video, OUTPUT_FOLDER)
-
-    print("-" * 30)
-    print("完成。")
-
-if __name__ == '__main__':
-    main()
+# 执行调整大小函数
+resize_image_half_pil(input_image_file, output_image_file)
