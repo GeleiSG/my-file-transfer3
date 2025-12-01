@@ -1,77 +1,87 @@
+import subprocess
 import os
-import torch
-from PIL import Image
-from diffusers import FluxKontextPipeline
-from diffusers.utils import load_image
+import glob
+from pathlib import Path
 
-# --- 配置区域 ---
-INPUT_DIR = "./input_frames"
-OUTPUT_DIR = "./output_kontext"
-MODEL_ID = "black-forest-labs/FLUX.1-Kontext-dev"
+# ================= 配置区域 =================
+INPUT_FOLDER = r'./videos'        # 输入文件夹
+OUTPUT_FOLDER = r'./output_frames' # 输出文件夹
 
-# 核心指令：这不再是描述画面，而是“下命令”
-# 针对您的伪纹理场景，我们尝试以下几种指令风格
-EDIT_INSTRUCTION = "Denoise the image, remove digital artifacts, and improve skin texture quality."
+# 逻辑参数
+TARGET_FPS = 16
+TARGET_FRAME_NUM = 25
 
-# Guidance Scale (引导系数)
-# 官方示例用了 2.5。
-# 对于去噪任务，建议在 2.0 - 3.5 之间尝试。
-# 太低：指令不生效（噪点去不掉）。
-# 太高：可能过度平滑或改变非目标区域。
-GUIDANCE_SCALE = 2.5 
+# 支持的扩展名
+VIDEO_EXTENSIONS = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
+# ===========================================
 
-# --- 初始化 ---
-print(f"正在加载 FLUX.1 Kontext [dev] ...")
-# 注意：Kontext 需要从 git 安装的 diffusers 加载
-pipe = FluxKontextPipeline.from_pretrained(
-    MODEL_ID, 
-    torch_dtype=torch.bfloat16
-)
+def get_timestamp(target_frame, target_fps):
+    """
+    计算时间戳 (秒)
+    公式: (帧号 - 1) / FPS
+    """
+    return (target_frame - 1) / target_fps
 
-# 显存优化
-pipe.enable_model_cpu_offload()
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def process_images():
-    valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
-    files = [f for f in os.listdir(INPUT_DIR) if os.path.splitext(f)[1].lower() in valid_exts]
+def extract_frame_ffmpeg(video_path, output_dir):
+    # 1. 计算时间点
+    timestamp = get_timestamp(TARGET_FRAME_NUM, TARGET_FPS)
     
-    print(f"开始处理 {len(files)} 张图片")
-    print(f"指令: {EDIT_INSTRUCTION}")
-    print(f"Guidance Scale: {GUIDANCE_SCALE}")
+    # 2. 准备输出路径
+    video_name = Path(video_path).stem
+    output_filename = f"{video_name}_fps{TARGET_FPS}_frame{TARGET_FRAME_NUM}.jpg"
+    output_path = os.path.join(output_dir, output_filename)
     
-    for filename in files:
-        img_path = os.path.join(INPUT_DIR, filename)
-        save_path = os.path.join(OUTPUT_DIR, filename)
-        
-        try:
-            # 1. 加载图片
-            input_image = load_image(img_path)
-            
-            # FLUX 仍然建议输入尺寸为 16 的倍数
-            w, h = input_image.size
-            new_w = w - (w % 16)
-            new_h = h - (h % 16)
-            if new_w != w or new_h != h:
-                input_image = input_image.resize((new_w, new_h), Image.LANCZOS)
-            
-            # 2. 执行编辑
-            # num_inference_steps 默认为 28-30 左右即可
-            result = pipe(
-                image=input_image,
-                prompt=EDIT_INSTRUCTION,
-                guidance_scale=GUIDANCE_SCALE,
-                num_inference_steps=28,
-                generator=torch.Generator("cpu").manual_seed(42)
-            ).images[0]
-            
-            # 3. 保存
-            result.save(save_path, quality=95)
-            print(f"[完成] {filename}")
-            
-        except Exception as e:
-            print(f"[失败] {filename}: {e}")
+    # 3. 构建 FFmpeg 命令
+    # -y: 覆盖同名文件
+    # -ss: 跳转到指定时间 (放在 -i 之前为快速定位，放在 -i 之后为精确解码定位)
+    #      这里我们放在 -i 之前以获得最快速度，现代 FFmpeg 在此模式下对单帧提取也很准。
+    # -i: 输入文件
+    # -frames:v 1: 只输出 1 帧
+    # -q:v 2: 输出高质量 JPG (范围 1-31, 2 为极高画质)
+    # -loglevel error: 减少控制台输出，只显示错误
+    
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-ss', str(timestamp), 
+        '-i', video_path,
+        '-frames:v', '1',
+        '-q:v', '2', 
+        '-loglevel', 'error', 
+        output_path
+    ]
+    
+    try:
+        # 执行命令
+        subprocess.run(cmd, check=True)
+        print(f"[成功] {output_filename} (时间: {timestamp}s)")
+    except subprocess.CalledProcessError:
+        print(f"[失败] 无法处理: {video_path}")
+    except FileNotFoundError:
+        print("[错误] 未找到 ffmpeg，请检查环境变量或安装 ffmpeg。")
+        exit()
 
-if __name__ == "__main__":
-    process_images()
+def main():
+    if not os.path.exists(OUTPUT_FOLDER):
+        os.makedirs(OUTPUT_FOLDER)
+
+    video_files = []
+    for ext in VIDEO_EXTENSIONS:
+        video_files.extend(glob.glob(os.path.join(INPUT_FOLDER, ext)))
+    
+    if not video_files:
+        print(f"在 {INPUT_FOLDER} 未找到视频。")
+        return
+
+    print(f"开始处理 {len(video_files)} 个视频...")
+    print(f"定位时间点: {get_timestamp(TARGET_FRAME_NUM, TARGET_FPS)} 秒")
+    print("-" * 30)
+
+    for video in video_files:
+        extract_frame_ffmpeg(video, OUTPUT_FOLDER)
+
+    print("-" * 30)
+    print("完成。")
+
+if __name__ == '__main__':
+    main()
