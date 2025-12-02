@@ -1,13 +1,118 @@
-echo "正在扫描所有环境，请稍候..."
-conda env list | grep -v "^#" | awk '{print $NF}' | while read env_path; do
-    # 查找在该环境下是否存在 flash_attn 文件夹
-    # 注意：路径通常是 lib/pythonX.X/site-packages/flash_attn
-    found=$(find "$env_path/lib" -maxdepth 3 -type d -name "flash_attn" 2>/dev/null)
+# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import torch
+import torch.nn.functional as F
+import warnings
+
+# 强制标记为不可用，防止后续逻辑误判
+FLASH_ATTN_3_AVAILABLE = False
+FLASH_ATTN_2_AVAILABLE = False
+
+__all__ = [
+    'flash_attention',
+    'attention',
+]
+
+def flash_attention(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    deterministic=False,
+    dtype=torch.bfloat16,
+    version=None,  # 保留此参数以兼容 clip.py 的调用
+):
+    """
+    这是一个"伪装"的 flash_attention，内部强制使用 PyTorch 原生 SDPA。
+    它可以接收 clip.py 传过来的参数，但会忽略 version 参数。
+    """
     
-    if [ ! -z "$found" ]; then
-        env_name=$(basename "$env_path")
-        echo -e "\033[32m[发现] 环境: $env_name \033[0m"
-        echo "       路径: $found"
-    fi
-done
-echo "扫描结束。"
+    # 1. 维度转换
+    # flash_attention 通常输入是 [B, L, H, D] (Batch, SeqLen, Heads, Dim)
+    # 但 torch 的 scaled_dot_product_attention 需要 [B, H, L, D]
+    # 所以我们需要先转置
+    
+    # 确保输入是 4D 张量 (Batch, SeqLen, Heads, HeadDim)
+    if q.dim() == 4:
+        q = q.transpose(1, 2) # [B, L, H, D] -> [B, H, L, D]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+    
+    # 2. 处理精度
+    # 如果指定了 dtype 且当前不是该 dtype，则转换
+    if dtype is not None and q.dtype != dtype:
+        q = q.to(dtype)
+        k = k.to(dtype)
+        v = v.to(dtype)
+
+    # 3. 处理 q_scale (如果有)
+    if q_scale is not None:
+        q = q * q_scale
+
+    # 4. 调用 PyTorch 原生注意力 (SDPA)
+    # 注意：SDPA 自动处理了 softmax_scale (如果不传则默认为 1/sqrt(dim))
+    # 如果 clip.py 没传 softmax_scale，SDPA 会自己算，这通常是正确的。
+    
+    # 关于 q_lens 和 k_lens: 
+    # 原生 SDPA 不支持变长序列的 lens 参数。
+    # 但在 CLIP 模型中（你的报错来源），通常输入是 padding 好的 Tensor，不需要 lens。
+    # 如果这里遇到了 lens 参数，我们打印一个警告。
+    if q_lens is not None or k_lens is not None:
+        warnings.warn(
+            'Warning: q_lens/k_lens passed to fallback attention. '
+            'Standard SDPA does not support this efficiently. Ignored.'
+        )
+
+    out = F.scaled_dot_product_attention(
+        q, 
+        k, 
+        v, 
+        attn_mask=None, 
+        dropout_p=dropout_p, 
+        is_causal=causal,
+        scale=softmax_scale
+    )
+
+    # 5. 转回原来的维度 [B, H, L, D] -> [B, L, H, D]
+    if out.dim() == 4:
+        out = out.transpose(1, 2).contiguous()
+
+    return out
+
+
+def attention(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    deterministic=False,
+    dtype=torch.bfloat16,
+    fa_version=None,
+):
+    # 直接调用上面改写过的 flash_attention 即可
+    return flash_attention(
+        q=q,
+        k=k,
+        v=v,
+        q_lens=q_lens,
+        k_lens=k_lens,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        q_scale=q_scale,
+        causal=causal,
+        window_size=window_size,
+        deterministic=deterministic,
+        dtype=dtype,
+        version=fa_version,
+    )
