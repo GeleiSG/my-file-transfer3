@@ -1,1 +1,13 @@
-python -c "import torch; import flash_attn; import diffusers; print(f'Torch: {torch.__version__}\nCUDA: {torch.version.cuda}\nFlash Attn: {flash_attn.__version__}\nDiffusers: {diffusers.__version__}')"
+echo "正在扫描所有环境，请稍候..."
+conda env list | grep -v "^#" | awk '{print $NF}' | while read env_path; do
+    # 查找在该环境下是否存在 flash_attn 文件夹
+    # 注意：路径通常是 lib/pythonX.X/site-packages/flash_attn
+    found=$(find "$env_path/lib" -maxdepth 3 -type d -name "flash_attn" 2>/dev/null)
+    
+    if [ ! -z "$found" ]; then
+        env_name=$(basename "$env_path")
+        echo -e "\033[32m[发现] 环境: $env_name \033[0m"
+        echo "       路径: $found"
+    fi
+done
+echo "扫描结束。"
